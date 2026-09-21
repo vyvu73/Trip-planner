@@ -26,6 +26,7 @@ build-backend = "poetry.core.masonry.api"
 
 [dependency-groups]
 dev = [
+    "firecrawl>=4.44.0",
     "praw>=8.0.3",
     "python-dotenv>=1.2.3",
 ]
