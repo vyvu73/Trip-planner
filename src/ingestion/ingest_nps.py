@@ -3,6 +3,7 @@ import requests
 import psycopg2
 from dotenv import load_dotenv
 from src.ingestion.nps_transformers import (
+    PARK_CODE_NAMES,
     transform_park,
     transform_article,
     transform_place,
@@ -47,7 +48,7 @@ def get_db_connection():
         host="localhost",
         port=5432,
         user="postgres",
-        database="raw_data_nps"
+        database="trip_planner"
     )
 
 def fetch_endpoint(endpoint, params=None):
@@ -95,6 +96,8 @@ def ingest_endpoint(endpoint, transformer, params=None):
             record = transformer(item)
             if not record["content"].strip():
                 continue
+            if not record["park_name"] and params:
+                record["park_name"] = PARK_CODE_NAMES.get(params.get("parkCode"), "")
             insert_nps_record(cursor, record)
         conn.commit()
     except Exception as e:
@@ -135,9 +138,16 @@ def main():
             ingest_endpoint(endpoint, transformer, {"parkCode": park_code})
 
 if __name__ == "__main__":
-    for ep in ENDPOINTS_TO_INGEST:
-        print(f"\n=== {ep} ===")
-        try:
-            test_endpoint(ep, "chis")
-        except Exception as e:
-            print(f"FAILED: {type(e).__name__}: {e}")
+    import sys
+
+    # python -m src.ingestion.ingest_nps          -> ingest everything
+    # python -m src.ingestion.ingest_nps --test   -> check each endpoint (no DB writes)
+    if "--test" in sys.argv:
+        for ep in ENDPOINTS_TO_INGEST:
+            print(f"\n=== {ep} ===")
+            try:
+                test_endpoint(ep, "chis")
+            except Exception as e:
+                print(f"FAILED: {type(e).__name__}: {e}")
+    else:
+        main()

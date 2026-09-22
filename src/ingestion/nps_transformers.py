@@ -45,6 +45,18 @@ PARK_CODE_NAMES = {
     "yose": "Yosemite National Park",
 }
 
+def pick_park_name(related_parks):
+    """
+    A record can list several related parks, and the one we queried is not
+    always first. Return the first one that is in PARK_CODE_NAMES (our scope).
+    Returns "" if none match; ingest_nps.py then falls back to the park it queried.
+    """
+    for park in related_parks or []:
+        if park.get("parkCode") in PARK_CODE_NAMES:
+            return park.get("fullName", "")
+    return ""
+
+
 def transform_park(item):
     description = clean_html(item.get("description", ""))
     directions = clean_html(item.get("directionsInfo", ""))
@@ -77,7 +89,7 @@ def transform_park(item):
 
 def transform_article(item):
     related_parks = item.get("relatedParks", [])
-    park_name = related_parks[0].get("fullName", "") if related_parks else ""
+    park_name = pick_park_name(related_parks)
 
     content = join_parts(
         clean_html(item.get("listingDescription", "")),
@@ -93,7 +105,7 @@ def transform_article(item):
 
 def transform_place(item):
     related_parks = item.get("relatedParks", [])
-    park_name = related_parks[0].get("fullName", "") if related_parks else ""
+    park_name = pick_park_name(related_parks)
     amenities = ", ".join(item.get("amenities", []))
 
     content = join_parts(
@@ -112,7 +124,7 @@ def transform_place(item):
 
 def transform_thing_to_do(item):
     related_parks = item.get("relatedParks", [])
-    park_name = related_parks[0].get("fullName", "") if related_parks else ""
+    park_name = pick_park_name(related_parks)
 
     activities = ", ".join(a.get("name", "") for a in item.get("activities", []))
     topics = ", ".join(t.get("name", "") for t in item.get("topics", []))
@@ -259,7 +271,7 @@ def transform_fees_passes(item):
 
 def transform_parking_lot(item):
     related_parks = item.get("relatedParks", [])
-    park_name = related_parks[0].get("fullName", "") if related_parks else ""
+    park_name = pick_park_name(related_parks)
 
     content = join_parts(
         clean_html(item.get("description", "")),

@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from firecrawl import Firecrawl
 
 from find_park_article_links import get_park_article_links   # <-- file 2
+from clean_web_markdown import clean_markdown, derive_page_type, is_dead_page
 
 
 # ============================================================
@@ -33,6 +34,11 @@ SOURCE = "visitcalifornia"
 
 # Start small to test. Set to None to scrape every link.
 MAX_ARTICLES = None
+
+# False: skip URLs already in raw_web_page (saves Firecrawl credits).
+# True:  scrape them again and overwrite the saved content (e.g. after
+#        changing the cleaning rules).
+RESCRAPE = False
 
 
 # ============================================================
@@ -88,19 +94,20 @@ def insert_web_page(conn, page):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO raw_web_page (source, park_name, title, url, content)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO raw_web_page (source, park_name, page_type, title, url, content)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (url)
             DO UPDATE SET
                 source     = EXCLUDED.source,
                 park_name  = COALESCE(raw_web_page.park_name, EXCLUDED.park_name),
+                page_type  = EXCLUDED.page_type,
                 title      = COALESCE(EXCLUDED.title, raw_web_page.title),
                 content    = EXCLUDED.content,
                 crawled_at = NOW()
             RETURNING id;
             """,
-            (page["source"], page["park_name"], page["title"],
-             page["url"], page["content"]),
+            (page["source"], page["park_name"], page["page_type"],
+             page["title"], page["url"], page["content"]),
         )
         return cur.fetchone()[0]
 
@@ -127,7 +134,7 @@ def main():
 
             print(f"\n[{i}/{len(links)}] {park_name}\n  {url}")
 
-            if url_exists(conn, url):
+            if not RESCRAPE and url_exists(conn, url):
                 print("  SKIPPED: already exists in database")
                 skipped += 1
                 continue
@@ -139,6 +146,14 @@ def main():
                 failed += 1
                 continue
 
+            if is_dead_page(title):
+                print(f"  SKIPPED: error page ({title})")
+                skipped += 1
+                continue
+
+            # Clean before saving: no nav, footer, images, or link URLs
+            markdown = clean_markdown(markdown)
+
             if not markdown.strip():
                 print("  SKIPPED: empty page")
                 skipped += 1
@@ -147,6 +162,7 @@ def main():
             row_id = insert_web_page(conn, {
                 "source": SOURCE,
                 "park_name": park_name,
+                "page_type": derive_page_type({"url": url}),
                 "title": title,
                 "url": url,
                 "content": markdown,
