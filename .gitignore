@@ -1,3 +1,4 @@
 
 #env file 
 .env
+#eval $(poetry env activate)

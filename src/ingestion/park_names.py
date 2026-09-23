@@ -35,3 +35,26 @@ def normalize_park(park_name):
         return None, park_name
 
     return code, PARK_DISPLAY_NAMES[code]
+
+
+# Words a person might use for each park, keyed by the same codes as
+# PARK_DISPLAY_NAMES above.
+PARK_ALIASES = {
+    "chis": ["channel islands"],
+    "deva": ["death valley"],
+    "jotr": ["joshua tree"],
+    "lavo": ["lassen"],
+    "pinn": ["pinnacles"],
+    "redw": ["redwood"],
+    "seki": ["sequoia", "kings canyon"],
+    "yose": ["yosemite", "half dome", "glacier point", "tunnel view"],
+}
+
+
+def detect_park_code(question):
+    """Return the park_code whose alias appears in the question, or None
+    if zero or more than one park is mentioned."""
+    lowered = question.lower()
+    matches = {code for code, aliases in PARK_ALIASES.items()
+               if any(alias in lowered for alias in aliases)}
+    return matches.pop() if len(matches) == 1 else None
