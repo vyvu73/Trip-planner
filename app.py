@@ -28,7 +28,7 @@ def handle_message(message, history):
         elif decision.route == "ambiguous":
             answer = decision.clarifying_question
         else:
-            chunks = retrieve_chunks(decision.standalone_question, k=10)
+            chunks = retrieve_chunks(decision.standalone_question, k=7)
             answer = generate_response(message, chunks, recent=history)
     except Exception as error:
         print(f"handle_message failed: {error}")

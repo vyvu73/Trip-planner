@@ -10,6 +10,13 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 EMBED_MODEL = os.getenv("EMBED_MODEL")
 
+REVIEW_SOURCE_TYPE = "tripadvisor"
+# A review is kept only if it is at most this much farther (cosine distance)
+# than the best fact chunk. Factual questions have a near-exact fact match,
+# so reviews trail far behind; experience questions don't. Tuned on the
+# plan's threshold prompts: "yes" margins <= 0.103, "no" margins >= 0.241.
+REVIEW_MAX_MARGIN = 0.15
+
 def get_db_connection():
     """Create and return a database connection"""
     return psycopg2.connect(
@@ -30,9 +37,42 @@ def generate_embedding(text):
     return response.data[0].embedding
 
 
-def search_chunks(conn, query_vector, question, k=5):
+def run_vector_query(conn, vector, park_name, reviews, limit):
+    """
+    Nearest chunks to `vector`, either reviews only or everything but reviews,
+    optionally scoped to one park.
+    """
+    conditions = ["source_type = %s" if reviews else "source_type <> %s"]
+    params = [vector, REVIEW_SOURCE_TYPE]
+
+    if park_name:
+        conditions.append("park_name = %s")
+        params.append(park_name)
+
+    params += [vector, limit]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT id, source_type, title, park_name, content, metadata,
+                   embedding <=> %s AS distance
+            FROM documents_chunks
+            WHERE {" AND ".join(conditions)}
+            ORDER BY embedding <=> %s
+            LIMIT %s;
+        """, params)
+
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def search_chunks(conn, query_vector, question, k=7, review_k=2):
     """
     Vector search over documents_chunks, optionally scoped to one park.
+
+    Reviews are searched separately so they neither crowd out facts nor
+    vanish under ~3,600 fact chunks: up to review_k reviews are kept, and only
+    if within REVIEW_MAX_MARGIN of the best fact. Unused review slots are backfilled with
+    facts, so k chunks come back whenever that many exist.
 
     detect_park_code works in codes (matches NPS's own parkCode, and is
     immune to punctuation/casing in the display name). The SQL filter
@@ -43,27 +83,20 @@ def search_chunks(conn, query_vector, question, k=5):
     park_name = PARK_DISPLAY_NAMES.get(park_code) if park_code else None
 
     vector = to_vector_literal(query_vector)          # from load_chunk.py
-    where_clause = "WHERE park_name = %s" if park_name else ""
 
-    params = [vector]
-    if park_name:
-        params.append(park_name)
-    params += [vector, k]
+    facts = run_vector_query(conn, vector, park_name, reviews=False, limit=k)
+    best_fact = facts[0]["distance"] if facts else None
 
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT id, title, park_name, content, embedding <=> %s AS distance
-            FROM documents_chunks
-            {where_clause}
-            ORDER BY embedding <=> %s
-            LIMIT %s;
-        """, params)
+    reviews = [
+        chunk
+        for chunk in run_vector_query(conn, vector, park_name, reviews=True, limit=review_k)
+        if best_fact is None or chunk["distance"] - best_fact < REVIEW_MAX_MARGIN
+    ]
 
-        columns = [desc[0] for desc in cur.description]
-        return [dict(zip(columns, row)) for row in cur.fetchall()]
+    return facts[:k - len(reviews)] + reviews
 
 
-def retrieve_chunks(question, k=5):
+def retrieve_chunks(question, k=7):
     """
     One-call entry point for chatpot.py: embed the question, open a
     connection, run the (optionally park-scoped) vector search, and
