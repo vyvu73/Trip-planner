@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 from src.retrieval.retrieve_chunks import retrieve_chunks
 from src.generation.generate_response import generate_response
-from src.generation.memory import condense_question 
+from src.generation.memory import route_message
 
 STORAGE_KEY = "trip_planner_chat_v1"
 STORAGE_SECRET = "12345"
@@ -22,9 +22,14 @@ def handle_message(message, history):
     outputs: [chatbot, msg textbox, state]
     """
     try:
-        question = condense_question(history, message)
-        chunks = retrieve_chunks(question, k=10)
-        answer = generate_response(message, chunks, recent=history)
+        decision = route_message(history, message)
+        if decision.route == "out_of_scope":
+            answer = decision.redirect_message
+        elif decision.route == "ambiguous":
+            answer = decision.clarifying_question
+        else:
+            chunks = retrieve_chunks(decision.standalone_question, k=10)
+            answer = generate_response(message, chunks, recent=history)
     except Exception as error:
         print(f"handle_message failed: {error}")
         answer = "Sorry, I ran into a problem answering that. Please try again."
@@ -56,4 +61,5 @@ with gr.Blocks(title="Plan your trip to Calinifornia National Parks") as demo:
     
     clear_btn.click(handle_clear, outputs=[chatbot, state])
 
-demo.launch()
+if __name__ == "__main__":
+    demo.launch()

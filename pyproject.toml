@@ -1,7 +1,25 @@
+[project]
+name = "trip-planner"
+version = "0.1.0"
+description = "Shared environment for RAG project"
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "gradio>=6.28.0",
+    "openai>=1.100.2",
+    "psycopg2-binary>=2.9.10",
+    "python-dotenv>=1.1.1",
+    "requests>=2.32.0",
+    "tiktoken>=0.12.0",
+]
+
+[tool.uv]
+package = false
+
 [tool.poetry]
 name = "trip-planner"
 version = "0.1.0"
-description = "Shared environment for RAG projecet"
+description = "Shared environment for RAG project"
 authors = ["Vy Vu"]
 readme = "README.md"
 package-mode = false
