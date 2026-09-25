@@ -18,10 +18,18 @@ MODEL = os.getenv("OPENAI_MODEL") or "gpt-5-mini"
 
 ROUTER_HISTORY_MESSAGES = 6
 
+# Routing and rewriting is a simple classification task; deeper reasoning
+# made it 3-6x slower (4-11s vs ~1.5s) with the same routes.
+ROUTER_REASONING = {"effort": "minimal"}
+
+
+ParkCode = Literal[tuple(PARK_DISPLAY_NAMES)]   # "chis", "deva", ..., "yose"
+
 
 class RouteDecision(BaseModel):
     route: Literal["in_scope", "ambiguous", "out_of_scope"]
     standalone_question: str
+    park_codes: list[ParkCode]
     clarifying_question: str | None
     redirect_message: str | None
 
@@ -35,7 +43,7 @@ def route_message(history, question):
     """Decide whether the latest message is in scope, rewrite it as a
     standalone question, and write the reply for ambiguous or out of scope
     messages. Errors propagate to the caller."""
-    parks = "\n".join(f"- {name}" for name in PARK_DISPLAY_NAMES.values())
+    parks = "\n".join(f"- {name} ({code})" for code, name in PARK_DISPLAY_NAMES.items())
     recent = format_turns(history[-ROUTER_HISTORY_MESSAGES:]) if history else "(none)"
 
     prompt = f"""
@@ -60,10 +68,15 @@ def route_message(history, question):
     - Informational questions about the parks above (e.g. park history).
     - Mixed questions that include one of the parks above alongside an
       unsupported one (e.g. Yosemite vs Yellowstone).
+    - Alerts, closures, or current conditions for a park named in the
+      message or earlier in the conversation.
 
     ambiguous:
     - Might be trip planning but key context is missing, e.g. "what's the
       weather this weekend?" with no park in the conversation.
+    - Alerts, closures, or current conditions ("any closures this week?")
+      only when no park is named in the message and none was discussed in
+      the conversation. If a park is known, it is in_scope.
 
     out_of_scope:
     - Unrelated topics (coding, recipes, general history).
@@ -78,6 +91,15 @@ def route_message(history, question):
       question that includes any park name, dates, or preferences it
       implicitly refers to from the conversation above. If it is already
       standalone, return it unchanged.
+    - park_codes: codes of the parks above that the latest message is about,
+      including a park it implicitly refers to from the conversation (e.g.
+      "is the road open?" after talking about a park -> that park's code).
+      Use several codes for comparisons. Only parks the user named or
+      discussed; never guess one for general messages like greetings or
+      "what can you do?". Empty if no park applies, and always empty for
+      out_of_scope.
+    - Park codes are internal: use them only in park_codes. Write park
+      names, never codes, in every other field.
     - clarifying_question: only for ambiguous, a short question asking for
       the missing context. Otherwise null.
     - redirect_message: only for out_of_scope, a friendly, conversational
@@ -122,7 +144,12 @@ def route_message(history, question):
     can help you plan hikes, camping, and a day-by-day itinerary.
     """
 
-    response = client.responses.parse(model=MODEL, input=prompt, text_format=RouteDecision)
+    response = client.responses.parse(
+        model=MODEL,
+        input=prompt,
+        text_format=RouteDecision,
+        reasoning=ROUTER_REASONING,
+    )
     decision = response.output_parsed
 
     if decision is None:

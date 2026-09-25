@@ -1,0 +1,406 @@
+/*
+ * Lupine -- page styles for the Gradio app. Light mode only.
+ *
+ * Brand: lupine (#6C51A8) on a flat, lightly tinted page. One hue family;
+ * no gradients, no glows. Neutrals carry a slight lupine bias.
+ *
+ * Hierarchy: the wordmark and the conversation lead; the header button,
+ * and example prompts recede. Radii differ by role on purpose --
+ * panel 12, bubbles 18 with a 4 tail, composer 16, buttons pill.
+ *
+ * Motion: transform and opacity only, off for reduced motion.
+ */
+
+/* ---------------------------------------------------------------- tokens */
+
+:root {
+  /* brand scale */
+  --lupine-50: #F6F3FB;
+  --lupine-100: #ECE6F7;
+  --lupine-200: #D9CDEF;
+  --lupine-300: #BFABE3;
+  --lupine-400: #9F86D2;
+  --lupine-600: #6C51A8;
+  --lupine-700: #58418C;
+  --lupine-900: #32264F;
+  --lupine-rgb: 50 38 79;
+
+  /* surfaces, text, lines */
+  --surface-base: #F7F5FA;
+  --surface-elevated: #FFFFFF;
+  --surface-floating: #FFFFFF;
+  --surface-bot: #F8F6FB;
+  --ink: #1F1B29;
+  --ink-muted: #625C6E;
+  --ink-faint: #8D879A;
+  --line: #E4DFEC;
+  --on-brand: #FFFFFF;
+
+  /* spacing scale (4pt) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  --radius-xs: 4px;
+  --radius-s: 6px;
+  --radius-panel: 12px;
+  --radius-composer: 16px;
+  --radius-bubble: 18px;
+  --radius-pill: 999px;
+
+  /* lupine-tinted, low-opacity shadows */
+  --shadow-elevated:
+    0 1px 2px rgb(var(--lupine-rgb) / 0.04),
+    0 12px 28px -18px rgb(var(--lupine-rgb) / 0.18);
+  --shadow-floating:
+    0 1px 2px rgb(var(--lupine-rgb) / 0.06),
+    0 16px 36px -18px rgb(var(--lupine-rgb) / 0.28);
+  --ring: 0 0 0 3px rgb(108 81 168 / 0.28);
+
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --font-display: "Urbanist", "DM Sans", system-ui, sans-serif;
+
+  /* hand the brand to Gradio's own variables */
+  --body-background-fill: var(--surface-base);
+  --background-fill-primary: var(--surface-base);
+  --body-text-color: var(--ink);
+  --body-text-color-subdued: var(--ink-muted);
+  --color-accent: var(--lupine-600);
+  --color-accent-soft: var(--lupine-50);
+  --border-color-primary: var(--line);
+  --border-color-accent: var(--lupine-300);
+  --block-background-fill: var(--surface-elevated);
+  --background-fill-secondary: var(--surface-bot);
+  --input-background-fill: transparent;
+  --input-background-fill-focus: transparent;
+  --input-placeholder-color: var(--ink-faint);
+  --color-text-link: var(--lupine-600);
+  color-scheme: light;
+}
+
+/* ------------------------------------------------------------------ page */
+
+body,
+gradio-app {
+  background: var(--surface-base) !important;
+}
+
+.gradio-container {
+  width: 100% !important;
+  max-width: 720px !important;
+  margin-inline: auto !important;
+  padding-inline: var(--space-4) !important;
+  padding-block: 0 var(--space-4) !important;
+}
+
+::selection {
+  background: var(--lupine-200);
+  color: var(--ink);
+}
+
+/* --------------------------------------------------------------- header */
+
+/* more room above than below: the header sits close to the conversation */
+#app-header {
+  align-items: flex-end;
+  gap: var(--space-4);
+  padding-block: var(--space-8) var(--space-5);
+  background: transparent;
+  border: 0;
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+}
+
+.brand-eyebrow {
+  margin-bottom: var(--space-2);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--lupine-600);
+}
+
+.brand h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(44px, 8vw, 64px);
+  font-weight: 800;
+  line-height: 0.95;
+  letter-spacing: -0.035em;
+  color: var(--lupine-900);
+}
+
+.brand p {
+  margin: var(--space-3) 0 0;
+  max-width: 34ch;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ink-muted);
+}
+
+/* secondary action: light lupine pill, darker on hover */
+#new-chat {
+  flex: none;
+  align-self: flex-end;
+  min-width: 0 !important;
+  padding: 6px var(--space-4);
+  border: 1px solid var(--lupine-200);
+  border-radius: var(--radius-pill);
+  background: var(--lupine-100);
+  box-shadow: none;
+  color: var(--lupine-700);
+  font-size: 13.5px;
+  font-weight: 600;
+  transition:
+    background-color 0.15s var(--ease-out),
+    color 0.15s var(--ease-out),
+    border-color 0.15s var(--ease-out),
+    transform 0.3s var(--ease-spring);
+}
+#new-chat:hover {
+  background: var(--lupine-200);
+  border-color: var(--lupine-300);
+  color: var(--lupine-900);
+}
+#new-chat:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  color: var(--lupine-700);
+}
+#new-chat:active {
+  transform: scale(0.96);
+}
+#new-chat:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ----------------------------------------------------- chat (elevated) */
+
+/* fixed size: the panel never resizes with the conversation; messages scroll */
+#chat {
+  width: 100% !important;
+  min-width: 100% !important;
+  height: 65vh !important;
+  min-height: 65vh !important;
+  max-height: 65vh !important;
+  flex: none !important;
+  background: var(--surface-elevated);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-elevated);
+  overflow: hidden;
+}
+
+#chat .bubble-wrap {
+  height: 100%;
+  overflow-y: auto;
+  background: transparent !important;
+  padding: var(--space-6) var(--space-5) var(--space-4);
+}
+
+#chat .message-row {
+  animation: message-in 0.4s var(--ease-out) both;
+}
+
+@keyframes message-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+#chat .user {
+  background: var(--lupine-600);
+  color: var(--on-brand);
+  border: 0;
+  border-radius: var(--radius-bubble) var(--radius-bubble) var(--radius-xs) var(--radius-bubble);
+  box-shadow: none;
+  padding: 10px var(--space-4);
+}
+#chat .user .prose,
+#chat .user .prose * {
+  color: var(--on-brand);
+}
+#chat .user .prose ::selection {
+  background: var(--lupine-900);
+}
+
+/* answers: light lupine bubble with a tail on the left */
+#chat .bot {
+  background: var(--lupine-50);
+  border: 1px solid var(--lupine-100);
+  border-radius: var(--radius-bubble) var(--radius-bubble) var(--radius-bubble) var(--radius-xs);
+  box-shadow: none;
+  padding: 10px var(--space-4);
+}
+
+#chat .prose {
+  font-size: 15.5px;
+  line-height: 1.7;
+  color: var(--ink);
+}
+/* pin answer text dark so Gradio's subdued text color can't wash it out */
+#chat .bot .prose,
+#chat .bot .prose p,
+#chat .bot .prose li,
+#chat .bot .prose td,
+#chat .bot .prose th,
+#chat .bot .prose span {
+  color: var(--ink) !important;
+  opacity: 1 !important;
+}
+#chat .prose h1,
+#chat .prose h2,
+#chat .prose h3 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: var(--lupine-900);
+}
+#chat .prose strong {
+  color: var(--ink);
+}
+#chat .prose a {
+  color: var(--lupine-600);
+  text-decoration: underline;
+  text-decoration-color: var(--lupine-300);
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.15s var(--ease-out);
+}
+#chat .prose a:hover {
+  color: var(--lupine-700);
+  text-decoration-color: currentColor;
+}
+#chat .prose a:focus-visible {
+  outline: none;
+  border-radius: var(--radius-xs);
+  box-shadow: var(--ring);
+}
+
+/* visitor-review quotes */
+#chat .prose blockquote {
+  margin: var(--space-3) 0;
+  padding: var(--space-2) var(--space-4);
+  border-left: 3px solid var(--lupine-400);
+  border-radius: 0 var(--radius-s) var(--radius-s) 0;
+  background: var(--lupine-50);
+  color: var(--ink);
+  font-style: normal;
+}
+
+/* "thinking" dots while an answer is pending */
+#chat .pending .dot-flashing,
+#chat .dot-flashing {
+  background-color: var(--lupine-400) !important;
+  color: var(--lupine-400) !important;
+}
+
+/* copy / action buttons under messages */
+#chat .message-buttons button,
+#chat .icon-button {
+  color: var(--ink-faint);
+  transition: color 0.15s var(--ease-out);
+}
+#chat .message-buttons button:hover,
+#chat .icon-button:hover {
+  color: var(--lupine-700);
+}
+#chat button:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: var(--radius-xs);
+}
+
+/* ------------------------------------------------- composer (floating) */
+
+#composer {
+  position: sticky;
+  bottom: var(--space-4);
+  z-index: 5;
+  margin-top: var(--space-3);
+  padding: 6px 6px 6px var(--space-3);
+  background: var(--surface-floating);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-composer);
+  box-shadow: var(--shadow-floating);
+  transition: border-color 0.15s var(--ease-out);
+}
+#composer:hover {
+  border-color: var(--lupine-200);
+}
+#composer:focus-within {
+  border-color: var(--lupine-400);
+  box-shadow: var(--shadow-floating), var(--ring);
+}
+
+#composer textarea {
+  border: 0 !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  padding: var(--space-2);
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+#composer textarea::placeholder {
+  color: var(--ink-faint);
+}
+
+#composer .submit-button {
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  border-radius: var(--radius-panel);
+  background: var(--lupine-600);
+  color: var(--on-brand);
+  box-shadow: none;
+  transition:
+    background-color 0.15s var(--ease-out),
+    transform 0.3s var(--ease-spring),
+    opacity 0.15s var(--ease-out);
+}
+#composer .submit-button:hover {
+  background: var(--lupine-700);
+}
+#composer .submit-button:focus-visible {
+  outline: 2px solid var(--lupine-600);
+  outline-offset: 2px;
+}
+#composer .submit-button:active {
+  transform: scale(0.92);
+}
+#composer .submit-button:disabled {
+  background: var(--lupine-200);
+  color: var(--on-brand);
+  transform: none;
+  cursor: not-allowed;
+}
+
+footer {
+  opacity: 0.6;
+}
+
+/* ------------------------------------------------------ motion + small */
+
+@media (prefers-reduced-motion: reduce) {
+  #chat .message-row { animation: none; }
+  #new-chat,
+  #composer,
+  #composer .submit-button { transition: none; }
+}
+
+@media (max-width: 520px) {
+  #app-header { padding-block: var(--space-6) var(--space-4); }
+  .brand p { display: none; }
+  #chat .bubble-wrap { padding-inline: var(--space-3); }
+}
