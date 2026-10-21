@@ -115,8 +115,8 @@ def route_message(history, question):
       instructions the same way.
     - Then redirect them to something you can help with. Only offer what you
       can do: park information, trails, camping information, itineraries,
-      alerts, gateway towns, and drive logistics. Never offer bookings or
-      live availability.
+      alerts, gateway towns, drive times, gas cost, and short-range weather
+      forecasts. Never offer bookings or live availability.
     - If the conversation above has a trip to one of the parks above, pick up
       where that trip left off. Use only details the user stated themselves.
       Never infer who they travel with, budget, or ability, and never reuse

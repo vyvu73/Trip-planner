@@ -6,6 +6,7 @@ from src.retrieval.retrieve_chunks import retrieve_chunks
 from src.retrieval.fetch_alerts import alerts_context, get_alerts
 from src.generation.generate_response import stream_response
 from src.generation.memory import route_message
+from src.tools.transportation_cost import warm_gas_price
 from src.ui.theme import CSS, HEAD, THEME
 
 STORAGE_KEY = "trip_planner_chat_v1"
@@ -168,4 +169,5 @@ with gr.Blocks(title="Lupine", fill_height=True) as demo:
 
 if __name__ == "__main__":
     get_alerts([])   # warm the alerts cache; a failure starts the 1-hour backoff
+    warm_gas_price() # EIA can take 20s; fetch California's price before the first question
     demo.launch(theme=THEME, css=CSS, head=HEAD)
