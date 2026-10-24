@@ -7,6 +7,7 @@ requires-python = ">=3.12,<4.0"
 dependencies = [
     "braintrust>=0.48.0",
     "gradio>=6.28.0",
+    "kitaru[cli,mcp,worker]>=0.27.2",
     "openai>=1.100.2",
     "psycopg2-binary>=2.9.10",
     "python-dotenv>=1.1.1",
