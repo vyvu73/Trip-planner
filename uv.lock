@@ -961,38 +961,6 @@ wheels = [
 ]
 
 [[package]]
-name = "kitaru"
-version = "0.27.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx" },
-    { name = "pydantic" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/97/ae/72442c874a48564949560b45630af48e0d39271315cfb1be51111c8fc295/kitaru-0.27.2.tar.gz", hash = "sha256:e83d85a28f33cea3ecfcd33ae305432210a43e3fc92367d8f9aaf1924f20ddd7", size = 6908036, upload-time = "2026-10-08T14:53:22.625Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/9e/dc30822e75c6bd371f55a0f507964fe2b5ea78e1f9fecc34faa98d2a42ec/kitaru-0.27.2-py3-none-any.whl", hash = "sha256:2448b1755af1c924413399feac0547ff7df8697fd7f7a77cf4e34f1315fbf938", size = 3415049, upload-time = "2026-10-08T14:53:20.22Z" },
-]
-
-[[package]]
-name = "kitaru-braintrust-importer"
-version = "0.4.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "kitaru" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/88/c2/b3b009706c37528420b31912b58af7efa630e337538c30bb6c951ecc09de/kitaru_braintrust_importer-0.4.0.tar.gz", hash = "sha256:fd3dfd6cd565f3d13ef6f094022809bc937824c1ae744aa63667edd599009f33", size = 20496, upload-time = "2026-09-21T17:32:17.887Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f1/60/1694580df6c088aa9004552c56ee5475c4900a174406339b4b639cd0108e/kitaru_braintrust_importer-0.4.0-py3-none-any.whl", hash = "sha256:a44dd8f1d50a2738d8dfdcff1b1d3af7b76eff94b98a1dda682257ec4d8f3045", size = 19484, upload-time = "2026-09-21T17:32:16.688Z" },
-]
-
-[package.optional-dependencies]
-adapter = [
-    { name = "braintrust" },
-    { name = "httpx" },
-    { name = "kitaru" },
-]
-
-[[package]]
 name = "markdown-it-py"
 version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2316,7 +2284,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "braintrust" },
     { name = "gradio" },
-    { name = "kitaru-braintrust-importer", extra = ["adapter"] },
     { name = "openai" },
     { name = "psycopg2-binary" },
     { name = "python-dotenv" },
@@ -2336,7 +2303,6 @@ dev = [
 requires-dist = [
     { name = "braintrust", specifier = ">=0.48.0" },
     { name = "gradio", specifier = ">=6.28.0" },
-    { name = "kitaru-braintrust-importer", extras = ["adapter"], specifier = "==0.4.0" },
     { name = "openai", specifier = ">=1.100.2" },
     { name = "psycopg2-binary", specifier = ">=2.9.10" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
