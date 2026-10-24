@@ -1,6 +1,8 @@
 #sends the final prompt to the LLM
 import os
+import re
 import openai
+from braintrust import wrap_openai
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -11,7 +13,7 @@ load_dotenv()
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-client = openai.OpenAI()
+client = wrap_openai(openai.OpenAI())
 MODEL = "gpt-5-mini"
 
 # "low" halved answer time vs the default "medium" (15s -> 7.5s) and still
@@ -21,6 +23,19 @@ REASONING = {"effort": "low"}
 # A cost question needs two rounds (route, then cost); the round after the
 # cap is forced to answer in text.
 MAX_TOOL_ROUNDS = 3
+
+# The model keeps opening with "Short answer:" despite the prompt rule, so
+# strip such a label from the start of the answer. Streaming holds back the
+# first few characters so the label never flashes on screen.
+OPENING_LABEL = re.compile(
+    r"^\s*(?:\*\*(?:short answer|tl;?dr|summary|answer):?\*\*:?|(?:short answer|tl;?dr|summary|answer):)\s*",
+    re.IGNORECASE,
+)
+LABEL_HOLD_CHARS = 20
+
+
+def strip_opening_label(text):
+    return OPENING_LABEL.sub("", text, count=1)
 
 SOURCE_LABELS = {
     "nps": "NPS official",
@@ -227,9 +242,13 @@ continue with what you know.
 
 ## Response formatting
 Format answers in Markdown.
-When an answer has more than one section, start each section with a
-bold header on its own line, e.g. **Getting there**, followed by the
-content on the next line. Do not use # headings.
+Open with the answer itself in plain text: the first words are the
+answer, with no header or label before it.
+Never write "Short answer", "Summary", "TL;DR", "Answer", or similar,
+as a header or as an inline prefix like "Short answer:".
+When more detail follows, start each later section with a bold header
+on its own line that names its topic, e.g. **Getting there**, followed
+by the content on the next line. Do not use # headings.
 Short answers (1–3 sentences) need no headers.
 
 ## Itinerary format
@@ -311,7 +330,8 @@ def stream_response(question, chunks, recent=None, alerts=""):
             if event.type == "response.output_text.delta":
                 text += separator + event.delta
                 separator = ""
-                yield text
+                if len(text) >= LABEL_HOLD_CHARS:
+                    yield strip_opening_label(text)
             elif event.type == "response.completed":
                 response = event.response
 
@@ -320,7 +340,7 @@ def stream_response(question, chunks, recent=None, alerts=""):
             break
 
         status = ", ".join(dict.fromkeys(TOOL_STATUS.get(call.name, "Working") for call in calls))
-        yield (text + "\n\n" if text else "") + f"_{status}…_"
+        yield (strip_opening_label(text) + "\n\n" if text else "") + f"_{status}…_"
 
         outputs = [
             {"type": "function_call_output", "call_id": call.call_id,
@@ -330,4 +350,4 @@ def stream_response(question, chunks, recent=None, alerts=""):
         request = {"input": outputs, "previous_response_id": response.id}
 
     # Replaces any status line; "" tells the caller the model gave no answer.
-    yield text
+    yield strip_opening_label(text)

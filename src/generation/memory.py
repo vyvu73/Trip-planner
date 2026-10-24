@@ -3,6 +3,7 @@ import os
 from typing import Literal
 
 import openai
+from braintrust import traced, wrap_openai
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
@@ -13,7 +14,7 @@ load_dotenv()
 API_KEY = os.getenv('OPENAI_API_KEY')
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=API_KEY)
+client = wrap_openai(OpenAI(api_key=API_KEY))
 MODEL = os.getenv("OPENAI_MODEL") or "gpt-5-mini"
 
 ROUTER_HISTORY_MESSAGES = 6
@@ -39,6 +40,7 @@ def format_turns(history):
     return "\n".join(f"{turn['role']}: {turn['content']}" for turn in history)
 
 
+@traced
 def route_message(history, question):
     """Decide whether the latest message is in scope, rewrite it as a
     standalone question, and write the reply for ambiguous or out of scope

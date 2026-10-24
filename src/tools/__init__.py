@@ -2,6 +2,7 @@
 import json
 
 from src.ingestion.park_names import PARK_DISPLAY_NAMES
+from src.tracing import traced_tool
 from src.tools.route import get_route
 from src.tools.transportation_cost import get_transportation_cost
 from src.tools.weather import get_weather
@@ -98,6 +99,10 @@ TOOL_STATUS = {
 def run_tool(name, arguments_json):
     """Run one tool call. Always returns text for the model, never raises."""
     print(f"tool call: {name}({arguments_json})")
+    return traced_tool(name, arguments_json, lambda: call_tool(name, arguments_json))
+
+
+def call_tool(name, arguments_json):
     try:
         arguments = json.loads(arguments_json)
         return TOOL_FUNCTIONS[name](**arguments)

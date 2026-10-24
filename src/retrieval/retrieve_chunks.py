@@ -1,13 +1,14 @@
 #takes the user query and returns relevant chunks
 import os
 import psycopg2
+from braintrust import traced, wrap_openai
 from openai import OpenAI
 from dotenv import load_dotenv
 from src.ingestion.park_names import PARK_DISPLAY_NAMES, detect_park_code
 from src.vector_store.load_chunk import to_vector_literal
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = wrap_openai(OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
 EMBED_MODEL = os.getenv("EMBED_MODEL")
 
 REVIEW_SOURCE_TYPE = "tripadvisor"
@@ -96,6 +97,7 @@ def search_chunks(conn, query_vector, question, k=7, review_k=2):
     return facts[:k - len(reviews)] + reviews
 
 
+@traced
 def retrieve_chunks(question, k=7):
     """
     One-call entry point for chatpot.py: embed the question, open a

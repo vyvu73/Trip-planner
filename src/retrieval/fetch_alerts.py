@@ -4,6 +4,7 @@ import threading
 import time
 
 import requests
+from braintrust import traced
 from dotenv import load_dotenv
 
 from src.ingestion.park_names import PARK_DISPLAY_NAMES
@@ -88,6 +89,7 @@ def format_alerts(alerts):
     return "\n\n".join(blocks)
 
 
+@traced
 def alerts_context(park_codes):
     """Prompt text for the alerts section; "" when no park applies."""
     if not park_codes:

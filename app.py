@@ -1,15 +1,21 @@
 import os
+import uuid
+
 import gradio as gr
 from dotenv import load_dotenv
 
+from braintrust import start_span
+
+from src.tracing import GIT_BRANCH, run_in_one_context
 from src.retrieval.retrieve_chunks import retrieve_chunks
 from src.retrieval.fetch_alerts import alerts_context, get_alerts
-from src.generation.generate_response import stream_response
+from src.generation.generate_response import MODEL, stream_response
 from src.generation.memory import route_message
 from src.tools.transportation_cost import warm_gas_price
 from src.ui.theme import CSS, HEAD, THEME
 
 STORAGE_KEY = "trip_planner_chat_v1"
+CONVERSATION_STORAGE_KEY = "trip_planner_conversation_v1"
 STORAGE_SECRET = "12345"
 
 EMPTY_HISTORY = []
@@ -31,32 +37,52 @@ def load_history(history):
     return history
 
 
-def stream_answer(message, history):
+def stream_answer(message, history, conversation_id=None):
     """
     Yield the assistant's answer as it grows (full text so far each time).
     Router replies arrive whole; generated answers stream token by token.
-    Always yields at least once.
+    Always yields at least once. Each turn is one Braintrust trace; turns of
+    one chat share conversation_id so they can be filtered together.
     """
-    try:
-        decision = route_message(history, message)
-        if decision.route == "out_of_scope":
-            yield decision.redirect_message
-            return
-        if decision.route == "ambiguous":
-            yield decision.clarifying_question
-            return
+    yield from run_in_one_context(answer_turn(message, history, conversation_id))
 
-        chunks = retrieve_chunks(decision.standalone_question, k=7)
-        alerts = alerts_context(decision.park_codes)
+
+def answer_turn(message, history, conversation_id):
+    turn = sum(1 for entry in history if entry["role"] == "user") + 1
+    with start_span(name="chat_turn", type="task") as span:
+        span.log(input=message, metadata={
+            "conversation_id": conversation_id,
+            "turn": turn,
+            "git_branch": GIT_BRANCH,
+            "model": MODEL,
+        })
         answer = ""
-        for answer in stream_response(message, chunks, recent=history, alerts=alerts):
-            yield answer
-        if not answer:
-            raise ValueError("Model returned an empty answer")
+        try:
+            decision = route_message(history, message)
+            span.log(metadata={"route": decision.route, "park_codes": decision.park_codes})
+            if decision.route == "out_of_scope":
+                answer = decision.redirect_message
+                yield answer
+                return
+            if decision.route == "ambiguous":
+                answer = decision.clarifying_question
+                yield answer
+                return
 
-    except Exception as error:
-        print(f"stream_answer failed: {error}")
-        yield ERROR_MESSAGE
+            chunks = retrieve_chunks(decision.standalone_question, k=7)
+            alerts = alerts_context(decision.park_codes)
+            for answer in stream_response(message, chunks, recent=history, alerts=alerts):
+                yield answer
+            if not answer:
+                raise ValueError("Model returned an empty answer")
+
+        except Exception as error:
+            print(f"stream_answer failed: {error}")
+            span.log(error=str(error))
+            answer = ERROR_MESSAGE
+            yield answer
+        finally:
+            span.log(output=answer)
 
 
 def handle_message(message, history):
@@ -84,19 +110,21 @@ def add_user_message(message, history):
     return history, "", history
 
 
-def respond(history):
+def respond(history, conversation_id):
     """
     Step 2 of a submit: stream the answer to the last user message into the
     chat. Each yield replaces the assistant message with the text so far.
+    The first message of a chat creates its conversation_id.
     """
+    conversation_id = conversation_id or str(uuid.uuid4())
     if not history or history[-1]["role"] != "user":
-        yield history, history
+        yield history, history, conversation_id
         return
 
     message, prior = history[-1]["content"], history[:-1]
-    for answer in stream_answer(message, prior):
+    for answer in stream_answer(message, prior, conversation_id):
         updated = history + [{"role": "assistant", "content": answer}]
-        yield updated, updated
+        yield updated, updated, conversation_id
 
 
 def pick_example(history, event: gr.SelectData):
@@ -105,12 +133,14 @@ def pick_example(history, event: gr.SelectData):
 
 
 def handle_clear():
-    """clear_btn.click handler -- resets both the display and the stored state."""
-    return EMPTY_HISTORY, EMPTY_HISTORY
+    """clear_btn.click handler -- resets the display, the stored history, and
+    the conversation_id (the next message starts a new one)."""
+    return EMPTY_HISTORY, EMPTY_HISTORY, ""
 
 load_dotenv()
 with gr.Blocks(title="Lupine", fill_height=True) as demo:
     state = gr.BrowserState(EMPTY_HISTORY, storage_key=STORAGE_KEY, secret=STORAGE_SECRET)
+    conversation = gr.BrowserState("", storage_key=CONVERSATION_STORAGE_KEY, secret=STORAGE_SECRET)
 
     with gr.Row(elem_id="app-header", equal_height=True):
         gr.HTML("""
@@ -151,8 +181,8 @@ with gr.Blocks(title="Lupine", fill_height=True) as demo:
         outputs=[chatbot, msg, state],
     ).then(
         fn=respond,
-        inputs=[state],
-        outputs=[chatbot, state],
+        inputs=[state, conversation],
+        outputs=[chatbot, state, conversation],
     )
 
     chatbot.example_select(
@@ -161,11 +191,11 @@ with gr.Blocks(title="Lupine", fill_height=True) as demo:
         outputs=[chatbot, msg, state],
     ).then(
         fn=respond,
-        inputs=[state],
-        outputs=[chatbot, state],
+        inputs=[state, conversation],
+        outputs=[chatbot, state, conversation],
     )
 
-    clear_btn.click(handle_clear, outputs=[chatbot, state])
+    clear_btn.click(handle_clear, outputs=[chatbot, state, conversation])
 
 if __name__ == "__main__":
     get_alerts([])   # warm the alerts cache; a failure starts the 1-hour backoff
