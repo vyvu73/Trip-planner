@@ -25,7 +25,7 @@ from kitaru.api_models.v1.session_node import (
 from src.kitaru_adapter.capture import capture, capture_error
 
 FRAMEWORK = "openai-responses"
-ADAPTER_VERSION = "0.1.0"
+ADAPTER_VERSION = "0.2.0"    # 0.2.0: pipeline steps recorded as spans
 ROOT_ID = "turn"
 BATCH_SIZE = 100
 # A failure write must not hang the worker after the turn already failed.
@@ -68,10 +68,14 @@ class Recorder:
     def capture(self, value):
         return capture(value, self.secrets)
 
-    async def start(self, *, inputs, input_text_selector, root_inputs, replay, name=None):
+    async def start(self, *, inputs, input_text_selector, root_inputs, replay, name=None,
+                    agent_id=None, agent_version_id=None, metadata=None):
         self.started_at = now()
         self.root_inputs = self.capture(root_inputs)
         session = await self.client.sessions.create(SessionCreateRequest(
+            agent_id=agent_id,
+            agent_version_id=agent_version_id,
+            metadata=self.capture(metadata or {}),
             origin=SessionOrigin.REPLAY if replay else SessionOrigin.RECORDED,
             status=SessionStatus.IN_PROGRESS,
             name=name,

@@ -1,20 +1,33 @@
 # Record one trip-planner turn as a Kitaru session, applying replay settings.
 #
-# Hooks the three places the app talks to the outside world, for one run:
-# memory.client (the router), generate_response.client (each answer round),
-# and generate_response.run_tool (tool dispatch). The app's code is unchanged.
+# Hooks the places the app talks to the outside world: memory.client (the
+# router), generate_response.client (each answer round),
+# generate_response.run_tool (tool dispatch), and the pipeline steps the app
+# runs on every question, retrieve_chunks and alerts_context, as app.py
+# calls them. The app's code is unchanged. The hooks are installed once and
+# send each call to the turn recording in the current context (current_run),
+# or straight through when none is, so concurrent Gradio chats each record
+# their own turn (see live.py).
 #
-# Boundary: one turn per process, from a plain script (a Kitaru worker task).
+# Pipeline steps are recorded as spans marked kind: pipeline, beside the
+# router at the top of the turn: the app's code runs them, the model never
+# asks for them. The server's history lookup only serves tool calls, so
+# steps replay from static cases or run live (see policy.py).
+#
+# run_turn is the worker's entry: one turn per process, from a plain script.
 # The app is sync and Kitaru's client is async, so run_turn owns one event
-# loop and runs Kitaru work on it before and after the app, never during it,
-# the way Kitaru's OpenAI Agents adapter runs run_sync. Not for the Gradio app:
-# the hooks are process-wide.
+# loop, the way Kitaru's OpenAI Agents adapter runs run_sync. The loop is
+# idle while the app runs, so a history lookup during the turn completes on
+# it directly: no thread, no second loop.
 import asyncio
+import inspect
 import json
 import os
+import sys
 import uuid
 import warnings
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from kitaru.api_models.v1.session import TokenUsage
@@ -23,7 +36,7 @@ from kitaru.api_models.v1.task import AgentTaskDetails
 from kitaru.client import KitaruAPIClient
 
 from src.kitaru_adapter.capture import capture_error, has_capture_marker, secret_values
-from src.kitaru_adapter.policy import APPROVED_PASSTHROUGH_TOOLS, prepare_policies
+from src.kitaru_adapter.policy import APPROVED_PASSTHROUGH_TOOLS, lookup_match, prepare_policies
 from src.kitaru_adapter.recorder import ROOT_ID, KitaruRecordingError, Recorder, now
 
 ROUTER, ANSWER = "router", "answer"
@@ -31,9 +44,31 @@ MODEL_PROVIDER = "openai"
 OVERRIDE_PARAMS = ("reasoning", "temperature", "max_output_tokens")
 RECORDED_PARAMS = (*OVERRIDE_PARAMS, "tool_choice", "stream")
 
-# What a Kitaru write failure does to the turn. Only "fail_fast" exists: the
-# app has no channel to report a degraded recording. See recording_failed.
+# What a Kitaru write failure does to a worker turn: fail it, since a replay
+# with a broken recording is useless. See recording_failed. Live chats are
+# best effort instead (live.py): the chat must keep working.
 AVAILABILITY = "fail_fast"
+
+# The turn being recorded in this context, if any.
+current_run = ContextVar("kitaru_current_run", default=None)
+
+# Fields of a retrieved chunk the prompt is built from, recorded and replayed.
+CHUNK_FIELDS = ("source_type", "title", "park_name", "content", "metadata")
+
+
+def chunks_record(chunks):
+    """Retrieved rows as JSON: the prompt's fields, plus id and distance to inspect."""
+    return [{**{key: chunk.get(key) for key in CHUNK_FIELDS},
+             "id": None if chunk.get("id") is None else str(chunk["id"]),
+             "distance": None if chunk.get("distance") is None else float(chunk["distance"])}
+            for chunk in chunks]
+
+
+# Pipeline steps app.py calls on every question, and how each result is recorded.
+STEPS = {
+    "retrieve_chunks": chunks_record,
+    "alerts_context": lambda text: text,
+}
 
 
 class ReplayOverrideError(ValueError):
@@ -242,7 +277,7 @@ class TurnRun:
                 output = run_tool(name, arguments_json)
                 failed = isinstance(output, str) and output.startswith(f"Tool {name} failed:")
             else:
-                output, failed = decision.result, decision.failed
+                output, failed = decision.value, decision.failed
         except BaseException as error:
             self.record_tool(name, arguments_json, started, decision, None,
                              capture_error(error, self.recorder.secrets))
@@ -278,52 +313,150 @@ class TurnRun:
             attributes=attributes,
         )
 
+    # --- pipeline steps ------------------------------------------------------
+
+    def step_call(self, name, function, args, kwargs):
+        started = now()
+        bound = inspect.signature(function).bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        decision = None
+        try:
+            decision = self.policies.decide_arguments(name, arguments)
+            if decision.passthrough:
+                value = function(*args, **kwargs)
+            elif decision.error is not None:
+                # The step raised in the recorded run; the app saw an exception.
+                raise RuntimeError(f"Recorded {name} failed: {decision.error}")
+            else:
+                value = decision.value
+        except BaseException as error:
+            self.record_step(name, arguments, started, decision, None,
+                             capture_error(error, self.recorder.secrets))
+            self.note(error)
+            raise
+        self.record_step(name, arguments, started, decision, STEPS[name](value), None)
+        return value
+
+    def record_step(self, name, arguments, started, decision, output, error):
+        recorder = self.recorder
+        attributes = {"kind": "pipeline"}
+        if decision is not None and decision.policy:
+            attributes.update(mocked=True, policy=decision.policy)
+        inputs = recorder.capture(arguments)
+        if has_capture_marker(inputs):
+            inputs = None
+            attributes["kitaru.tool_arguments"] = "capture_loss"
+        recorder.add_node(
+            node_type=NodeType.SPAN,
+            name=name,
+            parent=ROOT_ID,
+            started_at=started,
+            inputs=inputs,
+            outputs=recorder.capture(output),
+            status=NodeStatus.FAILED if error is not None else NodeStatus.COMPLETED,
+            error=error,
+            attributes=attributes,
+        )
+
 
 class RecordingResponses:
-    def __init__(self, responses, run, role):
-        self._responses, self._run, self._role = responses, run, role
+    def __init__(self, responses, role):
+        self._responses, self._role = responses, role
 
     def create(self, **kwargs):
-        return self._run.model_call(self._responses.create, kwargs, self._role)
+        run = current_run.get()
+        if run is None:
+            return self._responses.create(**kwargs)
+        return run.model_call(self._responses.create, kwargs, self._role)
 
     def parse(self, **kwargs):
-        return self._run.model_call(self._responses.parse, kwargs, self._role)
+        run = current_run.get()
+        if run is None:
+            return self._responses.parse(**kwargs)
+        return run.model_call(self._responses.parse, kwargs, self._role)
 
 
 class RecordingClient:
-    """An OpenAI client whose Responses calls go through the run's hooks."""
+    """An OpenAI client whose Responses calls go through the current run, if any."""
 
-    def __init__(self, client, run, role):
+    def __init__(self, client, role):
         self._client = client
-        self.responses = RecordingResponses(client.responses, run, role)
+        self.responses = RecordingResponses(client.responses, role)
 
     def __getattr__(self, name):
         return getattr(self._client, name)
 
 
-@contextmanager
-def hooked(run):
-    """Point the app's model clients and tool dispatcher at run, then restore them."""
+class RecordingTool:
+    """The app's tool dispatcher, through the current run if any."""
+
+    def __init__(self, run_tool):
+        self.run_tool = run_tool
+
+    def __call__(self, name, arguments_json):
+        run = current_run.get()
+        if run is None:
+            return self.run_tool(name, arguments_json)
+        return run.tool_call(name, arguments_json, self.run_tool)
+
+
+class RecordingStep:
+    """One pipeline step as app.py calls it, through the current run if any."""
+
+    def __init__(self, name, function):
+        self.name, self.function = name, function
+
+    def __call__(self, *args, **kwargs):
+        run = current_run.get()
+        if run is None:
+            return self.function(*args, **kwargs)
+        return run.step_call(self.name, self.function, args, kwargs)
+
+
+def app_namespace():
+    """app.py's globals, where answer_turn looks up its pipeline steps."""
+    module = sys.modules.get("app")
+    if module is None:
+        raise RuntimeError("app.py is not imported, so its pipeline steps cannot be recorded")
+    return vars(module)
+
+
+def install_hooks(app_globals):
+    """
+    Route the app's model clients, tool dispatcher, and pipeline steps through
+    current_run. Idempotent. app_globals is app.py's namespace: it runs as
+    __main__ under `python app.py`, so callers pass it rather than import app.
+    """
     from src.generation import generate_response, memory
 
     seams = [(memory, "client"), (generate_response, "client"), (generate_response, "run_tool")]
     missing = [f"{module.__name__}.{name}" for module, name in seams if not hasattr(module, name)]
+    missing += [f"app.{name}" for name in STEPS if name not in app_globals]
     if missing:
         raise RuntimeError(f"App seams moved, nothing would be recorded: {', '.join(missing)}")
-    originals = [(module, name, getattr(module, name)) for module, name in seams]
-    if any(isinstance(value, RecordingClient) for _, _, value in originals):
-        raise RuntimeError("Another turn is already recording in this process")
+    if not isinstance(memory.client, RecordingClient):
+        memory.client = RecordingClient(memory.client, ROUTER)
+    if not isinstance(generate_response.client, RecordingClient):
+        generate_response.client = RecordingClient(generate_response.client, ANSWER)
+    if not isinstance(generate_response.run_tool, RecordingTool):
+        generate_response.run_tool = RecordingTool(generate_response.run_tool)
+    for name in STEPS:
+        if not isinstance(app_globals[name], RecordingStep):
+            app_globals[name] = RecordingStep(name, app_globals[name])
 
-    original_run_tool = generate_response.run_tool
-    memory.client = RecordingClient(memory.client, run, ROUTER)
-    generate_response.client = RecordingClient(generate_response.client, run, ANSWER)
-    generate_response.run_tool = lambda name, arguments_json: run.tool_call(
-        name, arguments_json, original_run_tool)
+
+@contextmanager
+def recording(run, app_globals):
+    """Record the app's calls in this context to run."""
+    install_hooks(app_globals)
+    if current_run.get() is not None:
+        raise RuntimeError("A turn is already recording in this context")
+    token = current_run.set(run)
     try:
         yield
     finally:
-        for module, name, value in originals:
-            setattr(module, name, value)
+        current_run.reset(token)
 
 
 def recording_failed(phase, recorder, error, result=None):
@@ -365,7 +498,10 @@ def _run_turn(wait, answer, client, approved):
         # Setup failures are replay-safety refusals, never downgraded.
         turn_input = wait(resolve_input(client))
         replay = turn_input.replay
-        policies = wait(prepare_policies(client, replay, list(TOOL_FUNCTIONS), approved))
+        def lookup(tool_name, cache_key, occurrence):
+            return wait(lookup_match(client, replay.id, tool_name, cache_key, occurrence))
+
+        policies = prepare_policies(replay, list(TOOL_FUNCTIONS), lookup, approved, list(STEPS))
 
         try:
             wait(recorder.start(
@@ -381,7 +517,7 @@ def _run_turn(wait, answer, client, approved):
 
         run = TurnRun(recorder, policies, replay.override if replay else None)
         try:
-            with hooked(run):
+            with recording(run, app_namespace()):
                 text = answer(turn_input.question, turn_input.history)
             if run.first_failure is not None:
                 raise run.first_failure

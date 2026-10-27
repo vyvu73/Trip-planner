@@ -1,16 +1,20 @@
-# Replay tool policies for the trip planner's local tools.
+# Replay tool policies for the trip planner's local tools and pipeline steps
+# (retrieval and alerts, which the app runs on every question; see turn.py).
 #
 # Everything that can refuse a replay runs before the app does: unknown tool
-# names, unsupported policies, live tool calls nobody approved, and a baseline
-# that cannot serve history. During the run, policies are plain sync lookups.
+# names, unsupported policies, and live calls nobody approved. During the
+# run, policies are sync calls.
 #
-# History is preloaded from the baseline session (the app is sync, so it
-# cannot ask the Kitaru server mid-run). That limits history to the baseline
-# scope; the nth identical call replays the nth recorded one, in baseline
-# order, like the server's occurrence lookup.
+# History asks the Kitaru server (replays.tool_lookup), like Kitaru's released
+# adapters. A replay task may not read its baseline session directly, and the
+# server owns matching for every scope. With baseline scope, the nth
+# identical call replays the nth recorded one. The server keys tool calls
+# only, so pipeline steps (spans) cannot replay history: static or approved
+# passthrough only.
 import json
 from dataclasses import dataclass, field
 
+from kitaru.api_models.v1.replay import ToolLookupRequest
 from kitaru.api_models.v1.replay_config import (
     HistoryConfig,
     HistoryScope,
@@ -19,16 +23,18 @@ from kitaru.api_models.v1.replay_config import (
     StaticMatchMode,
     ToolPolicyOnMiss,
 )
-from kitaru.api_models.v1.session import SessionStatus
-from kitaru.api_models.v1.session_node import NodeStatus, NodeType, SessionNodeListParams
+from kitaru.api_models.v1.session_node import NodeStatus
 from kitaru.cache_keys import compute_tool_cache_key
 
 from src.kitaru_adapter.capture import has_capture_marker
 
-# Tools a replay may run for real, against live APIs. Empty: every replay
-# must answer every tool call from a static case or the baseline's history.
-# Add a tool name here to approve live calls to it, e.g. "get_weather".
-APPROVED_PASSTHROUGH_TOOLS = frozenset()
+# Tools and pipeline steps a replay may run for real, against live APIs and
+# the database. Anything not listed must be answered from a static case or
+# the baseline's history. Add a name to approve live calls, e.g. "get_weather".
+# Approved 2026-10-24: the two read-only pipeline steps (Postgres search, one
+# embedding call, public NPS alerts), because a replayed router rewrites the
+# question and the search query then misses the recorded history.
+APPROVED_PASSTHROUGH_TOOLS = frozenset({"retrieve_chunks", "alerts_context"})
 
 
 class ToolPolicyError(RuntimeError):
@@ -40,68 +46,91 @@ class ToolPolicyMissError(ToolPolicyError):
 
 
 @dataclass
-class Recorded:
-    """One baseline tool call: its status, result, and whether it replays safely."""
-    status: NodeStatus
-    result: object
-    error: str | None
-    replayable: bool
-
-
-@dataclass
 class Decision:
-    """What a policy did with one call: a result to return, or run the tool."""
-    result: str | None = None
-    policy: str | None = None    # set when the result did not come from the tool
-    failed: bool = False
-
-    @property
-    def passthrough(self):
-        return self.result is None
+    """What a policy did with one call: run it for real, or return value instead."""
+    passthrough: bool = False
+    value: object = None
+    policy: str | None = None    # set when the value did not come from the call
+    failed: bool = False         # the value stands for a failed call
+    error: str | None = None     # a recorded failure's error, when replaying one
 
 
 @dataclass
 class ToolPolicies:
-    """Per-run policy state: configs by tool, the baseline index, occurrence counters."""
+    """
+    Per-run policy state: configs by tool, and for history the server lookup,
+    lookup(tool_name, cache_key, occurrence) -> ToolLookupMatch or None.
+    """
     configs: dict
-    history: dict = field(default_factory=dict)       # (tool, cache_key) -> [Recorded]
-    occurrences: dict = field(default_factory=dict)   # (tool, cache_key) -> next index
+    lookup: object = None
+    occurrences: dict = field(default_factory=dict)   # (tool, cache_key) -> next baseline occurrence
 
     def decide(self, name, arguments_json):
+        """A model tool call: arguments and any replayed result are text."""
         config = self.configs.get(name)
         if config is None or isinstance(config, PassthroughConfig):
-            return Decision()
+            return Decision(passthrough=True)
         try:
             arguments = json.loads(arguments_json)
         except (TypeError, ValueError) as error:
             raise ToolPolicyError(f"Invalid JSON arguments for tool '{name}'") from error
+        decision = self.decide_arguments(name, arguments)
+        if decision.passthrough:
+            return decision
+        if decision.error is not None:
+            # The app's tools never raise; a failed call reached the model as this text.
+            decision.value = f"Tool {name} failed: {decision.error}"
+        else:
+            decision.value = as_tool_text(decision.value)
+        return decision
+
+    def decide_arguments(self, name, arguments):
+        """Any call by its parsed arguments; a replayed value is returned as recorded."""
+        config = self.configs.get(name)
+        if config is None or isinstance(config, PassthroughConfig):
+            return Decision(passthrough=True)
         if isinstance(config, StaticConfig):
             case = next((case for case in config.cases if case_matches(case, arguments)), None)
             if case is not None:
-                return Decision(as_tool_text(case.result), "static")
+                return Decision(value=case.result, policy="static")
         else:
-            decision = self._history(name, arguments)
+            decision = self._history(name, arguments, config.scope)
             if decision is not None:
                 return decision
         return miss(config, name)
 
-    def _history(self, name, arguments):
+    def _history(self, name, arguments, scope):
         cache_key = compute_tool_cache_key(name, arguments)
         if cache_key is None:
+            raise ToolPolicyError(f"Arguments for tool '{name}' cannot be replayed safely")
+        if scope is HistoryScope.BASELINE:
+            # Count per key and advance only on a hit, so repeated identical
+            # calls replay their own recorded results in order.
+            key = (name, cache_key)
+            occurrence = self.occurrences.get(key, 0)
+            match = self.lookup(name, cache_key, occurrence)
+            if match is not None:
+                self.occurrences[key] = occurrence + 1
+        else:
+            match = self.lookup(name, cache_key, None)    # wider scopes: the latest match
+        if match is None:
             return None
-        key = (name, cache_key)
-        index = self.occurrences.get(key, 0)
-        matches = self.history.get(key, [])
-        if index >= len(matches):
-            return None
-        self.occurrences[key] = index + 1
-        match = matches[index]
-        if not match.replayable:
-            raise ToolPolicyError(f"History result for tool '{name}' cannot be replayed safely")
         if match.status is NodeStatus.FAILED:
-            # The app's tools never raise; a failed call reached the model as this text.
-            return Decision(f"Tool {name} failed: {match.error}", "history", failed=True)
-        return Decision(as_tool_text(match.result), "history")
+            return Decision(policy="history", failed=True, error=match.error or "unknown error")
+        if match.status is not NodeStatus.COMPLETED:
+            raise ToolPolicyError(f"History lookup for tool '{name}' returned status '{match.status.value}'")
+        if has_capture_marker(match.result):
+            raise ToolPolicyError(f"History result for tool '{name}' cannot be replayed safely")
+        return Decision(value=match.result, policy="history")
+
+
+async def lookup_match(client, replay_id, tool_name, cache_key, occurrence):
+    """One server history lookup, as Kitaru's released adapters make it."""
+    response = await client.replays.tool_lookup(replay_id, ToolLookupRequest(
+        tool_name=tool_name, cache_key=cache_key, occurrence=occurrence))
+    if "match" not in response.model_fields_set:
+        raise ToolPolicyError("The Kitaru server's tool lookup has no 'match'; upgrade the server for history replay")
+    return response.match
 
 
 def case_matches(case, arguments):
@@ -117,10 +146,10 @@ def case_matches(case, arguments):
 
 def miss(config, name):
     if config.on_miss is ToolPolicyOnMiss.PASSTHROUGH:
-        return Decision()
+        return Decision(passthrough=True)
     message = f"No {config.type} result for tool '{name}'"
     if config.on_miss is ToolPolicyOnMiss.ERROR_RESULT:
-        return Decision(json.dumps({"error": message}), config.type, failed=True)
+        return Decision(value={"error": message}, policy=config.type, failed=True)
     raise ToolPolicyMissError(message)
 
 
@@ -135,8 +164,16 @@ def runs_live(config):
         and config.on_miss is ToolPolicyOnMiss.PASSTHROUGH)
 
 
-def check_policy(tool_policy, tool_names, approved=APPROVED_PASSTHROUGH_TOOLS):
-    """Each tool's effective config, or ToolPolicyError if the replay is unsafe."""
+def check_policy(tool_policy, tool_names, approved=APPROVED_PASSTHROUGH_TOOLS, step_names=()):
+    """
+    Each tool's and pipeline step's effective config, or ToolPolicyError if
+    the replay is unsafe. Steps are spans, which the server's history lookup
+    does not serve, so history is refused for them. They feed the app data,
+    not the model text, so an {"error": ...} stand-in would break the app:
+    error_result is refused too.
+    """
+    step_names = list(step_names)
+    tool_names = [*tool_names, *step_names]
     unknown = sorted(set(tool_policy.tools) - set(tool_names))
     if unknown:
         raise ToolPolicyError(f"Tool policy names unknown tools: {', '.join(unknown)}")
@@ -146,9 +183,13 @@ def check_policy(tool_policy, tool_names, approved=APPROVED_PASSTHROUGH_TOOLS):
         config = tool_policy.tools.get(name, tool_policy.default)
         if not isinstance(config, (PassthroughConfig, StaticConfig, HistoryConfig)):
             raise ToolPolicyError(f"Tool policy '{config.type}' is not supported for '{name}'")
-        if isinstance(config, HistoryConfig) and config.scope is not HistoryScope.BASELINE:
+        if name in step_names and isinstance(config, HistoryConfig):
             raise ToolPolicyError(
-                f"History scope '{config.scope.value}' is not supported for '{name}'; use baseline")
+                f"History is not supported for pipeline step '{name}'; give it a static "
+                f"policy, or passthrough if it is in APPROVED_PASSTHROUGH_TOOLS")
+        if (name in step_names and isinstance(config, StaticConfig)
+                and config.on_miss is ToolPolicyOnMiss.ERROR_RESULT):
+            raise ToolPolicyError(f"on_miss: error_result is not supported for pipeline step '{name}'")
         if runs_live(config) and name not in approved:
             raise ToolPolicyError(
                 f"Replay could call '{name}' live, which is not approved; give it a static "
@@ -158,41 +199,9 @@ def check_policy(tool_policy, tool_names, approved=APPROVED_PASSTHROUGH_TOOLS):
     return configs
 
 
-async def load_history(client, session_id, tool_names):
-    """Index a terminal baseline's tool calls by (tool, cache key), in baseline order."""
-    session = await client.sessions.get(session_id)
-    if session.status is SessionStatus.IN_PROGRESS:
-        raise ToolPolicyError("Baseline session is still in progress; its history is incomplete")
-
-    history = {}
-    params = SessionNodeListParams(include_payloads=True)
-    async for node in client.sessions.iter_nodes(session_id, params):
-        if node.node_type is not NodeType.TOOL_CALL or node.tool_name not in tool_names:
-            continue
-        if node.status is NodeStatus.IN_PROGRESS:
-            raise ToolPolicyError(f"Baseline call to '{node.tool_name}' never finished")
-        cache_key = node.cache_key
-        if cache_key is None and not has_capture_marker(node.inputs):
-            cache_key = compute_tool_cache_key(node.tool_name, node.inputs)
-        if cache_key is None:
-            continue    # arguments were not recorded whole: this call can never match
-        history.setdefault((node.tool_name, cache_key), []).append(Recorded(
-            status=node.status,
-            result=node.outputs,
-            error=node.error,
-            replayable=(node.status is NodeStatus.FAILED
-                        or (node.outputs is not None and not has_capture_marker(node.outputs))),
-        ))
-    return history
-
-
-async def prepare_policies(client, replay, tool_names, approved=APPROVED_PASSTHROUGH_TOOLS):
+def prepare_policies(replay, tool_names, lookup, approved=APPROVED_PASSTHROUGH_TOOLS, step_names=()):
     """Tool policies for one run: all passthrough when recording, checked when replaying."""
     if replay is None:
         return ToolPolicies(configs={})
-    policies = ToolPolicies(configs=check_policy(replay.tool_policy, tool_names, approved))
-    history_tools = {name for name, config in policies.configs.items()
-                     if isinstance(config, HistoryConfig)}
-    if history_tools:
-        policies.history = await load_history(client, replay.baseline_session_id, history_tools)
-    return policies
+    return ToolPolicies(configs=check_policy(replay.tool_policy, tool_names, approved, step_names),
+                        lookup=lookup)

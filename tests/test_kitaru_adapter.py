@@ -31,13 +31,17 @@ from kitaru.api_models.v1.session import (
     SessionUpdateRequest,
 )
 from kitaru.api_models.v1.session_node import NodeStatus, NodeType, SessionNodeBatchRequest
+from kitaru.api_models.v1.replay import ToolLookupMatch, ToolLookupRequest, ToolLookupResponse
 from kitaru.cache_keys import compute_tool_cache_key
+from kitaru.client.exceptions import AuthorizationError
 
 import app
 import kitaru_replay
 from src.generation import generate_response, memory
+from src.retrieval.fetch_alerts import alerts_context as real_alerts_context
+from src.retrieval.retrieve_chunks import retrieve_chunks as real_retrieve_chunks
 from src.generation.memory import RouteDecision
-from src.kitaru_adapter.policy import ToolPolicyError, ToolPolicyMissError
+from src.kitaru_adapter.policy import APPROVED_PASSTHROUGH_TOOLS, ToolPolicyError, ToolPolicyMissError
 from src.kitaru_adapter.recorder import ROOT_ID, KitaruRecordingError
 from src.kitaru_adapter.turn import ReplayOverrideError, question_and_history, run_turn
 
@@ -123,29 +127,43 @@ class FakeSessions:
         self.kitaru.updates.append(request)
         self.kitaru.maybe_fail("update")
 
+    # Like the real server, a replay task may not read other sessions, its baseline included.
     async def get(self, session_id):
-        return SimpleNamespace(status=self.kitaru.baseline_status)
+        raise AuthorizationError(403, f"Session {session_id} is not accessible to this caller")
 
-    async def iter_nodes(self, session_id, params):
-        assert params.include_payloads
-        for node in self.kitaru.baseline:
-            yield node
+    async def iter_nodes(self, session_id, params=None):
+        raise AuthorizationError(403, f"Session {session_id} is not accessible to this caller")
+        yield
 
 
 class FakeKitaru:
-    def __init__(self, replay=None, baseline=(), baseline_status=SessionStatus.COMPLETED, fail=None):
+    def __init__(self, replay=None, baseline=(), fail=None):
         self.sessions = FakeSessions(self)
-        self.replays = SimpleNamespace(get=self._get_replay)
+        self.replays = SimpleNamespace(get=self._get_replay, tool_lookup=self._tool_lookup)
         self.replay = replay
         self.baseline = list(baseline)
-        self.baseline_status = baseline_status
         self.fail = dict(fail or {})    # operation -> calls to let through before failing
         self.session = self.session_id = None
         self.nodes, self.order, self.updates = {}, [], []
+        self.lookups = []
         self.closed = 0
 
     async def _get_replay(self, replay_id):
         return self.replay
+
+    async def _tool_lookup(self, replay_id, request):
+        """The server's history lookup: tool calls only, keyed when they were stored."""
+        assert isinstance(request, ToolLookupRequest) and replay_id == self.replay.id
+        self.lookups.append(request)
+        matches = [node for node in self.baseline
+                   if node.node_type is NodeType.TOOL_CALL and node.tool_name == request.tool_name
+                   and node.cache_key == request.cache_key]
+        if request.occurrence is None:
+            node = matches[-1] if matches else None
+        else:
+            node = matches[request.occurrence] if request.occurrence < len(matches) else None
+        match = None if node is None else ToolLookupMatch(result=node.outputs, status=node.status, error=node.error)
+        return ToolLookupResponse(match=match)
 
     def maybe_fail(self, operation):
         if operation in self.fail:
@@ -159,6 +177,14 @@ class FakeKitaru:
     # inspection
     def children(self, node_type):
         return [node for node in self.nodes.values() if node.node_type is node_type]
+
+    def tools(self):
+        """Tool calls the model made, without the pipeline steps."""
+        return [node for node in self.children(NodeType.TOOL_CALL) if node.attributes.get("kind") != "pipeline"]
+
+    def steps(self):
+        return {node.name: node for node in self.children(NodeType.SPAN)
+                if node.attributes.get("kind") == "pipeline"}
 
     def everything_sent(self):
         dumped = [self.session.model_dump(mode="json")] if self.session else []
@@ -187,10 +213,20 @@ def static(*cases, on_miss=ToolPolicyOnMiss.FAIL):
     return StaticConfig(cases=list(cases), on_miss=on_miss)
 
 
+def any_call(result):
+    return StaticConfig(cases=[StaticCase(match_mode=StaticMatchMode.SUBSET, result=result)],
+                        on_miss=ToolPolicyOnMiss.FAIL)
+
+
+# Pipeline steps answered from fixed values unless a test says otherwise.
+STEP_POLICIES = {"retrieve_chunks": any_call([]), "alerts_context": any_call("")}
+
+
 def all_tools(config, **tools):
-    """A policy that sets every tool, so nothing defaults to passthrough."""
+    """A policy that sets every tool and step, so nothing defaults to passthrough."""
     names = ("get_weather", "get_route", "get_transportation_cost")
-    return ToolPolicy(default=config, tools={name: tools.get(name, config) for name in names})
+    policies = {**STEP_POLICIES, **{name: config for name in names}, **tools}
+    return ToolPolicy(default=config, tools=policies)
 
 
 # --- harness ------------------------------------------------------------------
@@ -198,9 +234,12 @@ def all_tools(config, **tools):
 class AdapterTestCase(unittest.TestCase):
     def setUp(self):
         self.weather = mock.Mock(return_value="LIVE forecast: sunny")
+        # Autospec keeps the real signatures, so steps record what they would in production.
+        self.retrieve = mock.create_autospec(real_retrieve_chunks, return_value=[])
+        self.alerts = mock.create_autospec(real_alerts_context, return_value="")
         patchers = [
-            mock.patch.object(app, "retrieve_chunks", mock.Mock(return_value=[])),
-            mock.patch.object(app, "alerts_context", mock.Mock(return_value="")),
+            mock.patch.object(app, "retrieve_chunks", self.retrieve),
+            mock.patch.object(app, "alerts_context", self.alerts),
             mock.patch.dict("src.tools.TOOL_FUNCTIONS", {"get_weather": self.weather}),
         ]
         for patcher in patchers:
@@ -255,17 +294,21 @@ class RecordingTests(AdapterTestCase):
         self.assertEqual(rounds[0].tokens.input_tokens, 10)
         self.assertTrue(all(node.parent_external_id == ROOT_ID for node in [router, *rounds]))
 
-        [tool] = kitaru.children(NodeType.TOOL_CALL)
+        [tool] = kitaru.tools()
         self.assertEqual((tool.tool_name, tool.inputs, tool.outputs),
                          ("get_weather", WEATHER_ARGS, "LIVE forecast: sunny"))
         self.assertEqual(tool.parent_external_id, "resp_1")
         self.assertEqual(tool.attributes, {})
         self.weather.assert_called_once_with(park_code="yose")    # recording runs tools live
 
-    def test_hooks_are_removed_after_the_turn(self):
-        original_run_tool = generate_response.run_tool
-        self.run_turn(weather_turn(), FakeKitaru())
-        self.assertIs(generate_response.run_tool, original_run_tool)
+    def test_hooks_pass_calls_through_after_the_turn(self):
+        kitaru = FakeKitaru()
+        self.run_turn(weather_turn(), kitaru)
+        recorded = len(kitaru.nodes)
+
+        self.assertEqual(generate_response.run_tool("get_weather", json.dumps(WEATHER_ARGS)),
+                         "LIVE forecast: sunny")
+        self.assertEqual(len(kitaru.nodes), recorded)
 
     def test_turns_inputs_become_question_and_history(self):
         inputs = {"turns": [{"inputs": "Hi", "outputs": "Hello!"}, {"inputs": "Weather in Yosemite?"}]}
@@ -296,7 +339,7 @@ class RecordingTests(AdapterTestCase):
         kitaru = FakeKitaru()
         self.run_turn(weather_turn(rounds), kitaru)
 
-        [tool] = kitaru.children(NodeType.TOOL_CALL)
+        [tool] = kitaru.tools()
         self.assertIsNone(tool.inputs)
         self.assertEqual(tool.attributes["kitaru.tool_arguments"], "capture_loss")
 
@@ -433,12 +476,47 @@ class ToolPolicyTests(AdapterTestCase):
         self.run_turn(responses, kitaru)
 
         self.weather.assert_not_called()
-        first, second = kitaru.children(NodeType.TOOL_CALL)
+        first, second = kitaru.tools()
         self.assertEqual(first.outputs, "Recorded: rain")
         self.assertEqual(second.outputs, '{"periods": ["snow"]}')
         self.assertEqual(first.attributes, {"mocked": True, "policy": "history"})
         sent = responses.calls[2][1]["input"]
         self.assertEqual([item["output"] for item in sent], ["Recorded: rain", '{"periods": ["snow"]}'])
+        # Asked the server for occurrence 0, then 1; the baseline itself is never read.
+        self.assertEqual([(r.tool_name, r.occurrence) for r in kitaru.lookups],
+                         [("get_weather", 0), ("get_weather", 1)])
+        self.assertEqual(kitaru.lookups[0].cache_key, compute_tool_cache_key("get_weather", WEATHER_ARGS))
+
+    def test_a_missed_occurrence_is_not_counted(self):
+        calls = [function_call("get_weather", WEATHER_ARGS, "c1"), function_call("get_weather", WEATHER_ARGS, "c2")]
+        rounds = [stream_round("resp_1", calls=calls), stream_round("resp_2", text="Done.")]
+        kitaru = FakeKitaru(replay=replay(all_tools(history(on_miss=ToolPolicyOnMiss.ERROR_RESULT))),
+                            baseline=[baseline_tool("get_weather", WEATHER_ARGS, "Recorded: rain")])
+        self.run_turn(weather_turn(rounds), kitaru)
+
+        self.assertEqual([r.occurrence for r in kitaru.lookups], [0, 1])
+        first, second = kitaru.tools()
+        self.assertEqual((first.outputs, second.status), ("Recorded: rain", NodeStatus.FAILED))
+
+    def test_wider_history_scopes_ask_for_the_latest_match(self):
+        for scope in (HistoryScope.COHORT_VERSION, HistoryScope.AGENT):
+            with self.subTest(scope=scope):
+                baseline = [baseline_tool("get_weather", WEATHER_ARGS, "older"),
+                            baseline_tool("get_weather", WEATHER_ARGS, "latest")]
+                kitaru = FakeKitaru(replay=replay(all_tools(history(scope=scope))), baseline=baseline)
+                self.run_turn(weather_turn(), kitaru)
+
+                self.assertEqual([r.occurrence for r in kitaru.lookups], [None])
+                self.assertEqual(kitaru.tools()[0].outputs, "latest")
+
+    def test_server_without_match_field_is_refused(self):
+        kitaru = FakeKitaru(replay=replay(all_tools(history())))
+
+        async def old_server(replay_id, request):
+            return ToolLookupResponse.model_construct()
+        kitaru.replays.tool_lookup = old_server
+        with self.assertRaisesRegex(ToolPolicyError, "upgrade the server"):
+            self.run_turn(weather_turn(), kitaru)
 
     def test_history_miss_fails_the_replay(self):
         kitaru = FakeKitaru(replay=replay(all_tools(history())), baseline=[])
@@ -446,7 +524,7 @@ class ToolPolicyTests(AdapterTestCase):
         with self.assertRaises(ToolPolicyMissError):
             self.run_turn(weather_turn(), kitaru)
         self.weather.assert_not_called()
-        [tool] = kitaru.children(NodeType.TOOL_CALL)
+        [tool] = kitaru.tools()
         self.assertEqual(tool.status, NodeStatus.FAILED)
         self.assertEqual(kitaru.updates[-1].status, SessionStatus.FAILED)
 
@@ -455,7 +533,7 @@ class ToolPolicyTests(AdapterTestCase):
         result = self.run_turn(weather_turn(), kitaru)
 
         self.assertEqual(result.answer, "Pack layers.")
-        [tool] = kitaru.children(NodeType.TOOL_CALL)
+        [tool] = kitaru.tools()
         self.assertEqual(tool.status, NodeStatus.FAILED)
         self.assertEqual(json.loads(tool.outputs), {"error": "No history result for tool 'get_weather'"})
 
@@ -464,7 +542,7 @@ class ToolPolicyTests(AdapterTestCase):
         kitaru = FakeKitaru(replay=replay(all_tools(history())), baseline=baseline)
         self.run_turn(weather_turn(), kitaru)
 
-        [tool] = kitaru.children(NodeType.TOOL_CALL)
+        [tool] = kitaru.tools()
         self.assertEqual(tool.outputs, "Tool get_weather failed: NWS down")
         self.assertEqual(tool.status, NodeStatus.FAILED)
 
@@ -476,20 +554,13 @@ class ToolPolicyTests(AdapterTestCase):
         with self.assertRaisesRegex(ToolPolicyError, "cannot be replayed safely"):
             self.run_turn(weather_turn(), kitaru)
 
-    def test_in_progress_baseline_is_refused_before_recording(self):
-        kitaru = FakeKitaru(replay=replay(all_tools(history())), baseline_status=SessionStatus.IN_PROGRESS)
-
-        with self.assertRaisesRegex(ToolPolicyError, "still in progress"):
-            self.run_turn(weather_turn(), kitaru)
-        self.assertIsNone(kitaru.session)
-
     def test_static_cases_match_exactly_or_by_subset(self):
         cases = [StaticCase(match={"park_code": "jotr"}, match_mode=StaticMatchMode.EXACT, result="Desert heat"),
                  StaticCase(match={"park_code": "yose"}, match_mode=StaticMatchMode.SUBSET, result={"sky": "clear"})]
         kitaru = FakeKitaru(replay=replay(all_tools(static(*cases))))
         self.run_turn(weather_turn(), kitaru)
 
-        [tool] = kitaru.children(NodeType.TOOL_CALL)
+        [tool] = kitaru.tools()
         self.assertEqual(tool.outputs, '{"sky": "clear"}')
         self.assertEqual(tool.attributes["policy"], "static")
         self.weather.assert_not_called()
@@ -514,13 +585,12 @@ class ToolPolicyTests(AdapterTestCase):
         self.run_turn(weather_turn(), kitaru, approved=frozenset({"get_weather"}))
 
         self.weather.assert_called_once_with(park_code="yose")
-        [tool] = kitaru.children(NodeType.TOOL_CALL)
+        [tool] = kitaru.tools()
         self.assertEqual(tool.attributes, {})
 
     def test_unsupported_policies_are_refused_before_recording(self):
         refused = {
             "llm": all_tools(history(), get_weather=LLMConfig(model="gpt-5")),
-            "scope": all_tools(history(scope=HistoryScope.AGENT)),
             "unknown tools": ToolPolicy(default=history(), tools={"book_hotel": history()}),
         }
         for reason, policy in refused.items():
@@ -529,6 +599,123 @@ class ToolPolicyTests(AdapterTestCase):
                 with self.assertRaises(ToolPolicyError):
                     self.run_turn(weather_turn(), kitaru)
                 self.assertIsNone(kitaru.session)
+
+
+# --- pipeline steps -------------------------------------------------------------
+
+CHUNK = {"id": uuid.UUID("00000000-0000-0000-0000-00000000000a"), "source_type": "nps",
+         "title": "Yosemite weather", "park_name": "Yosemite National Park",
+         "content": "Valley highs reach 90F in summer.", "metadata": {}, "distance": 0.12,
+         "embedding": [0.1] * 4}
+RECORDED_CHUNK = {"source_type": "nps", "title": "Yosemite weather", "park_name": "Yosemite National Park",
+                  "content": "Valley highs reach 90F in summer.", "metadata": {},
+                  "id": "00000000-0000-0000-0000-00000000000a", "distance": 0.12}
+RETRIEVE_ARGS = {"question": "Weather in Yosemite?", "k": 7}
+ALERTS_ARGS = {"park_codes": ["yose"]}
+
+
+class PipelineStepTests(AdapterTestCase):
+    def test_steps_are_recorded_before_the_answer(self):
+        self.retrieve.return_value = [CHUNK]
+        self.alerts.return_value = "Tioga Road is closed."
+        kitaru = FakeKitaru()
+        self.run_turn(weather_turn(), kitaru)
+
+        steps = kitaru.steps()
+        self.assertEqual(set(steps), {"retrieve_chunks", "alerts_context"})
+        retrieval = steps["retrieve_chunks"]
+        self.assertEqual(retrieval.node_type, NodeType.SPAN)     # the app ran it, not the model
+        self.assertIsNone(retrieval.tool_name)
+        self.assertEqual(retrieval.inputs, RETRIEVE_ARGS)
+        self.assertEqual(retrieval.outputs, [RECORDED_CHUNK])     # allowlisted, no embedding
+        self.assertEqual(retrieval.parent_external_id, ROOT_ID)
+        self.assertEqual(retrieval.attributes, {"kind": "pipeline"})
+        self.assertEqual((steps["alerts_context"].inputs, steps["alerts_context"].outputs),
+                         (ALERTS_ARGS, "Tioga Road is closed."))
+        order = kitaru.order
+        self.assertLess(order.index(retrieval.external_id), order.index("resp_1"))
+        [tool] = kitaru.tools()
+        self.assertEqual(tool.tool_name, "get_weather")
+
+    def test_static_steps_supply_fixed_context(self):
+        policy = all_tools(history(), retrieve_chunks=any_call([RECORDED_CHUNK]),
+                           alerts_context=any_call("Tioga Road is closed."))
+        responses = weather_turn()
+        kitaru = FakeKitaru(replay=replay(policy), baseline=[baseline_tool("get_weather", WEATHER_ARGS, "rain")])
+        self.run_turn(responses, kitaru)
+
+        self.retrieve.assert_not_called()
+        self.alerts.assert_not_called()
+        first_round = responses.calls[1][1]["input"]
+        self.assertIn("Valley highs reach 90F in summer.", first_round)    # chunks stay chunks
+        self.assertIn("Tioga Road is closed.", first_round)
+        self.assertEqual(kitaru.steps()["retrieve_chunks"].attributes,
+                         {"kind": "pipeline", "mocked": True, "policy": "static"})
+
+    def test_history_is_refused_for_steps_before_recording(self):
+        # The server's lookup serves tool calls only; a step span would always miss.
+        for step in ("retrieve_chunks", "alerts_context"):
+            with self.subTest(step=step):
+                kitaru = FakeKitaru(replay=replay(all_tools(history(), **{step: history()})))
+                with self.assertRaisesRegex(ToolPolicyError, f"History is not supported for pipeline step '{step}'"):
+                    self.run_turn(weather_turn(), kitaru)
+                self.assertIsNone(kitaru.session)
+                self.assertEqual(kitaru.lookups, [])
+
+    def test_live_steps_and_recorded_tools_together(self):
+        # The approved experiment's policy: steps live, tools from history.
+        self.retrieve.return_value = [CHUNK]
+        policy = all_tools(history(), retrieve_chunks=PassthroughConfig(), alerts_context=PassthroughConfig())
+        kitaru = FakeKitaru(replay=replay(policy), baseline=[baseline_tool("get_weather", WEATHER_ARGS, "rain")])
+        self.run_turn(weather_turn(), kitaru)
+
+        self.retrieve.assert_called_once()
+        self.weather.assert_not_called()
+        self.assertEqual([r.tool_name for r in kitaru.lookups], ["get_weather"])
+
+    def test_step_failure_is_recorded_with_its_cause(self):
+        self.retrieve.side_effect = ConnectionError("database down")
+        kitaru = FakeKitaru()
+
+        with self.assertRaisesRegex(ConnectionError, "database down"):
+            self.run_turn(weather_turn(), kitaru)
+        retrieval = kitaru.steps()["retrieve_chunks"]
+        self.assertEqual(retrieval.status, NodeStatus.FAILED)
+        self.assertIn("database down", retrieval.error)
+
+    def test_steps_are_locked_like_tools(self):
+        for policy in [all_tools(history(), retrieve_chunks=PassthroughConfig()),
+                       all_tools(history(), alerts_context=static(on_miss=ToolPolicyOnMiss.PASSTHROUGH))]:
+            with self.subTest(policy=policy):
+                kitaru = FakeKitaru(replay=replay(policy))
+                with self.assertRaisesRegex(ToolPolicyError, "not approved"):
+                    self.run_turn(weather_turn(), kitaru, approved=frozenset())
+                self.assertIsNone(kitaru.session)
+
+    def test_project_approves_only_the_read_only_steps(self):
+        self.assertEqual(APPROVED_PASSTHROUGH_TOOLS, {"retrieve_chunks", "alerts_context"})
+
+    def test_approved_step_runs_live(self):
+        self.retrieve.return_value = [CHUNK]
+        policy = all_tools(static(StaticCase(match_mode=StaticMatchMode.SUBSET, result="sun")),
+                           retrieve_chunks=PassthroughConfig())
+        self.run_turn(weather_turn(), FakeKitaru(replay=replay(policy)),
+                      approved=frozenset({"retrieve_chunks"}))
+        self.retrieve.assert_called_once_with("Weather in Yosemite?", k=7)
+
+    def test_error_result_is_refused_for_steps(self):
+        policy = all_tools(history(), alerts_context=static(on_miss=ToolPolicyOnMiss.ERROR_RESULT))
+        kitaru = FakeKitaru(replay=replay(policy))
+
+        with self.assertRaisesRegex(ToolPolicyError, "error_result is not supported"):
+            self.run_turn(weather_turn(), kitaru)
+        self.assertIsNone(kitaru.session)
+
+    def test_steps_pass_through_outside_a_turn(self):
+        self.run_turn(weather_turn(), FakeKitaru())
+        self.retrieve.reset_mock()
+        app.retrieve_chunks("Hikes?", k=3)
+        self.retrieve.assert_called_once_with("Hikes?", k=3)
 
 
 class EventLoopTests(unittest.TestCase):

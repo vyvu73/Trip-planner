@@ -137,6 +137,11 @@ def handle_clear():
     the conversation_id (the next message starts a new one)."""
     return EMPTY_HISTORY, EMPTY_HISTORY, ""
 
+# KITARU_RECORD=1 records each turn as a Kitaru session (src/kitaru_adapter/live.py).
+if os.getenv("KITARU_RECORD") == "1":
+    from src.kitaru_adapter.live import record_turns
+    respond = record_turns(respond, error_message=ERROR_MESSAGE)
+
 load_dotenv()
 with gr.Blocks(title="Lupine", fill_height=True) as demo:
     state = gr.BrowserState(EMPTY_HISTORY, storage_key=STORAGE_KEY, secret=STORAGE_SECRET)

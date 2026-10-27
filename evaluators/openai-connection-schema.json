@@ -1,0 +1,13 @@
+{
+  "$comment": "What steer_back_judge.py needs from a Kitaru connection. Declares the shape only; never put a key here.",
+  "type": "object",
+  "properties": {
+    "OPENAI_API_KEY": {
+      "type": "string",
+      "writeOnly": true,
+      "description": "OpenAI API key the judge uses."
+    }
+  },
+  "required": ["OPENAI_API_KEY"],
+  "additionalProperties": false
+}
