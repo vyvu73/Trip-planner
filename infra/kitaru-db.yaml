@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kitaru database (us-east-1) - RDS Postgres 16 in the private subnets, reachable only from the Kitaru EC2.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-01e9bf42fec92ae61               # Kitaru-vpc (hand-built)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0a9c26f00b76a5ea4            # private1, us-east-1a
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0702b5090d3308d46            # private2, us-east-1b
+  Ec2SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-00e7ac53fc224fd4b                # launch-Kitaru-2 (the EC2's firewall)
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: kitaru-db-subnets
+      DBSubnetGroupDescription: Kitaru RDS - private subnets in 1a and 1b
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: kitaru-rds-sg
+      GroupDescription: Kitaru RDS - Postgres from the Kitaru EC2 only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Postgres from Kitaru EC2
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref Ec2SecurityGroupId
+
+  Ec2ToRdsEgress:                                # EC2's SG only allows outbound 443; open 5432 to RDS only
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref Ec2SecurityGroupId
+      Description: Postgres to Kitaru RDS
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !GetAtt RdsSecurityGroup.GroupId
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot                     # delete leaves one copy (final snapshot)
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: kitaru-db
+      Engine: postgres
+      EngineVersion: "16"                        # same major version as the Docker DB
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true                     # can't be turned on later
+      DBName: kitaru
+      MasterUsername: postgres
+      MasterUserPassword: "{{resolve:ssm-secure:/kitaru/rds-password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt RdsSecurityGroup.GroupId
+      AvailabilityZone: us-east-1a               # same AZ as EC2
+      MultiAZ: false
+      PubliclyAccessible: false
+      DeletionProtection: false                  # 1-command delete; DeletionPolicy keeps a snapshot
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      BackupRetentionPeriod: 7                   # 7 days, restore to any minute
+      PreferredBackupWindow: "05:00-05:30"       # UTC = 10 pm Pacific
+      AutomaticBackupReplicationRegion: us-west-2          # copy backups to Oregon
+      AutomaticBackupReplicationRetentionPeriod: 7
+      AutomaticBackupReplicationKmsKeyId: !Sub arn:aws:kms:us-west-2:${AWS::AccountId}:alias/aws/rds   # DB is encrypted
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
+  DbPort:
+    Value: !GetAtt DbInstance.Endpoint.Port
+  RdsSecurityGroupId:
+    Value: !GetAtt RdsSecurityGroup.GroupId

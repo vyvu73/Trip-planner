@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kitaru alerts (us-east-1) - SNS email topic and CloudWatch alarms for the EC2 server and RDS.
+
+Parameters:
+  Ec2InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Default: i-063f164932773c6f2                 # Kitaru-server
+  DbInstanceId:
+    Type: String
+    Default: kitaru-db                           # from the kitaru-db stack (fixed name)
+  AlertEmail:
+    Type: String
+    Default: vy.vu1@outlook.com
+
+Resources:
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: kitaru-alerts
+
+  AlertsEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  Ec2StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: kitaru-ec2-status
+      AlarmDescription: Kitaru EC2 failed a status check (server broken or unreachable)
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref Ec2InstanceId
+      Statistic: Maximum
+      Period: 300                                # 5 min
+      EvaluationPeriods: 2                       # 2 in a row = 10 min
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]              # also email when it recovers
+
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: kitaru-rds-cpu
+      AlarmDescription: Kitaru RDS CPU above 80% for 15 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DbInstanceId
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3                       # 3 x 5 min = 15 min
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  RdsStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: kitaru-rds-storage
+      AlarmDescription: Kitaru RDS free storage below 2 GB
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DbInstanceId
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648                      # 2 GB in bytes
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+Outputs:
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic

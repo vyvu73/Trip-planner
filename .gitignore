@@ -2,3 +2,6 @@
 #env file 
 .env
 #eval $(poetry env activate)
+# Kitaru server notes (IPs, account IDs) - keep local only
+kitaru-server-md/
+CLAUDE.md
