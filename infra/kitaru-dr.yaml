@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kitaru DR (us-west-2) - replica bucket for S3 dumps.
+
+Resources:
+  ReplicaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub kitaru-dumps-replica-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled                      # required for replication
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+
+  ReplicaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReplicaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: HttpsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ReplicaBucket.Arn
+              - !Sub ${ReplicaBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  ReplicaBucketArn:
+    Value: !GetAtt ReplicaBucket.Arn
+  ReplicaBucketName:
+    Value: !Ref ReplicaBucket

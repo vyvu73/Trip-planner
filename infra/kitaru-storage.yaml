@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kitaru storage (us-east-1) - dumps bucket with replication to us-west-2, and server access to it.
+
+Parameters:
+  ReplicaBucketArn:
+    Type: String
+    Default: arn:aws:s3:::kitaru-dumps-replica-954545501568   # kitaru-dr output (us-west-2)
+
+Resources:
+  DumpsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub kitaru-dumps-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled                      # required for replication
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      ReplicationConfiguration:              # auto-copy to the us-west-2 replica
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+          - Id: copy-to-us-west-2
+            Status: Enabled
+            Priority: 1
+            Filter: {}                       # every file
+            DeleteMarkerReplication:
+              Status: Disabled               # deleting here keeps the copy
+            Destination:
+              Bucket: !Ref ReplicaBucketArn
+
+  DumpsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DumpsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: HttpsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt DumpsBucket.Arn
+              - !Sub ${DumpsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: kitaru-s3-replication
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: replicate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetReplicationConfiguration, s3:ListBucket]
+                Resource: !Sub arn:aws:s3:::kitaru-dumps-${AWS::AccountId}
+              - Effect: Allow
+                Action: [s3:GetObjectVersionForReplication, s3:GetObjectVersionAcl, s3:GetObjectVersionTagging]
+                Resource: !Sub arn:aws:s3:::kitaru-dumps-${AWS::AccountId}/*
+              - Effect: Allow
+                Action: [s3:ReplicateObject, s3:ReplicateDelete, s3:ReplicateTags]
+                Resource: !Sub ${ReplicaBucketArn}/*
+
+  Ec2AccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: kitaru-ec2-access
+      Roles: [EC2-SSM-Role]                  # hand-built role; this stack only adds this policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ListDumps
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt DumpsBucket.Arn
+          - Sid: ReadWriteDumps              # no delete: the server can't wipe backups
+            Effect: Allow
+            Action: [s3:PutObject, s3:GetObject]
+            Resource: !Sub ${DumpsBucket.Arn}/*
+          - Sid: ReadRdsPassword
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/kitaru/rds-password
+
+Outputs:
+  DumpsBucketName:
+    Value: !Ref DumpsBucket
+  DumpsBucketArn:
+    Value: !GetAtt DumpsBucket.Arn

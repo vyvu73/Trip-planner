@@ -1,0 +1,24 @@
+# Kitaru agent version for the trip planner's project-local adapter
+# (kitaru_replay.py, src/kitaru_adapter). Register with:
+#   kitaru agent version register trip-planner --spec kitaru-agent-version.yaml
+# Records one turn per task. Replays apply overrides (model, system prompt,
+# prompt, reasoning / temperature / max_output_tokens) and static or
+# baseline-history tool policies. Live calls (passthrough, or
+# on_miss: passthrough) are refused unless the name is listed in
+# APPROVED_PASSTHROUGH_TOOLS (src/kitaru_adapter/policy.py), empty by default.
+# retrieve_chunks and alerts_context are pipeline steps the app runs on every
+# question, not model tools; they are listed so replays can set their policy.
+display_version: kitaru-adapter-steps
+description: Project-local adapter (kitaru_replay.py); one turn per session, overrides, static and baseline-history policies for tools and pipeline steps
+capabilities:
+  tools: [get_weather, get_route, get_transportation_cost, retrieve_chunks, alerts_context]
+run_spec:
+  command: .venv/bin/python kitaru_replay.py
+  working_dir: /home/vv03007/projects/Trip-planner
+  # Kitaru records these runs directly: no Braintrust traces.
+  env:
+    BRAINTRUST_API_KEY: ""
+  timeout_seconds: 300
+  runtime_capabilities:
+    overrides: true
+    tool_policies: true
