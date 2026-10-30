@@ -1,4 +1,5 @@
 import os
+import threading
 import uuid
 
 import gradio as gr
@@ -203,6 +204,7 @@ with gr.Blocks(title="Lupine", fill_height=True) as demo:
     clear_btn.click(handle_clear, outputs=[chatbot, state, conversation])
 
 if __name__ == "__main__":
-    get_alerts([])   # warm the alerts cache; a failure starts the 1-hour backoff
-    warm_gas_price() # EIA can take 20s; fetch California's price before the first question
+    # Warm external API caches without delaying the web server binding its port.
+    threading.Thread(target=get_alerts, args=([],), daemon=True).start()
+    threading.Thread(target=warm_gas_price, daemon=True).start()
     demo.launch(theme=THEME, css=CSS, head=HEAD)

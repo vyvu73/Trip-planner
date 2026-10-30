@@ -13,6 +13,9 @@ EMBED_BATCH = 100
 
 def get_db_connection():
     """Create and return a database connection"""
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        return psycopg2.connect(database_url, connect_timeout=10)
     return psycopg2.connect(
         host="localhost",
         port=5432,
