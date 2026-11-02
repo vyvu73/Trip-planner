@@ -25,7 +25,7 @@ from kitaru.api_models.v1.session_node import (
 from src.kitaru_adapter.capture import capture, capture_error
 
 FRAMEWORK = "openai-responses"
-ADAPTER_VERSION = "0.2.0"    # 0.2.0: pipeline steps recorded as spans
+ADAPTER_VERSION = "0.3.0"    # 0.2.0: pipeline steps recorded as spans; 0.3.0: route_message span
 ROOT_ID = "turn"
 BATCH_SIZE = 100
 # A failure write must not hang the worker after the turn already failed.
@@ -92,10 +92,15 @@ class Recorder:
         return session
 
     def add_node(self, *, node_type, name, parent, started_at, inputs, outputs,
-                 status=NodeStatus.COMPLETED, error=None, external_id=None, **fields):
-        """Buffer one child node; returns its external id for children of its own."""
+                 status=NodeStatus.COMPLETED, error=None, external_id=None, position=None, **fields):
+        """
+        Buffer one child node; returns its external id for children of its own.
+        position inserts it ahead of nodes buffered since, so a parent recorded
+        after its children is still sent before them.
+        """
         external_id = external_id or uuid.uuid4().hex
-        self.buffer.append(SessionNodeCreateRequest(
+        position = len(self.buffer) if position is None else position
+        self.buffer.insert(position, SessionNodeCreateRequest(
             external_id=external_id,
             parent_external_id=parent,
             node_type=node_type,

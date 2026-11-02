@@ -14,6 +14,10 @@
 # asks for them. The server's history lookup only serves tool calls, so
 # steps replay from static cases or run live (see policy.py).
 #
+# Functions in SPANS (route_message) are recorded as spans marked kind:
+# function, with the model calls they make nested under them. They only
+# group the trace: they always run live and no replay policy applies.
+#
 # run_turn is the worker's entry: one turn per process, from a plain script.
 # The app is sync and Kitaru's client is async, so run_turn owns one event
 # loop, the way Kitaru's OpenAI Agents adapter runs run_sync. The loop is
@@ -69,6 +73,9 @@ STEPS = {
     "retrieve_chunks": chunks_record,
     "alerts_context": lambda text: text,
 }
+
+# App functions recorded as spans around their calls; never mocked.
+SPANS = ("route_message",)
 
 
 class ReplayOverrideError(ValueError):
@@ -169,6 +176,7 @@ class TurnRun:
         self.override = override
         self.first_failure = None
         self.answer_node = None    # the latest answer round: parent of its tool calls
+        self.open_span = None      # the SPANS function running now: parent of its model calls
 
     def note(self, error):
         # The app turns errors into a friendly message; keep the real one.
@@ -246,7 +254,7 @@ class TurnRun:
         external_id = recorder.add_node(
             node_type=NodeType.LLM_CALL,
             name=f"openai.responses.{'parse' if role == ROUTER else 'create'}",
-            parent=ROOT_ID,
+            parent=self.open_span or ROOT_ID,
             started_at=started,
             inputs=inputs,
             outputs=outputs,
@@ -360,6 +368,46 @@ class TurnRun:
         )
 
 
+    # --- function spans ------------------------------------------------------
+
+    def span_call(self, name, function, args, kwargs):
+        """Run function live, recorded as a span around the model calls it makes."""
+        recorder = self.recorder
+        span_id = uuid.uuid4().hex
+        position = len(recorder.buffer)    # sent before the children it groups
+        started = now()
+        bound = inspect.signature(function).bind(*args, **kwargs)
+        bound.apply_defaults()
+        inputs = recorder.capture(dict(bound.arguments))
+        previous, self.open_span = self.open_span, span_id
+
+        def record(outputs, error):
+            recorder.add_node(
+                node_type=NodeType.SPAN,
+                name=name,
+                parent=previous or ROOT_ID,
+                started_at=started,
+                inputs=inputs,
+                outputs=outputs,
+                status=NodeStatus.FAILED if error is not None else NodeStatus.COMPLETED,
+                error=error,
+                external_id=span_id,
+                position=position,
+                attributes={"kind": "function"},
+            )
+
+        try:
+            value = function(*args, **kwargs)
+        except BaseException as error:
+            self.open_span = previous
+            record(None, capture_error(error, recorder.secrets))
+            self.note(error)
+            raise
+        self.open_span = previous
+        record(recorder.capture(value), None)
+        return value
+
+
 class RecordingResponses:
     def __init__(self, responses, role):
         self._responses, self._role = responses, role
@@ -414,6 +462,19 @@ class RecordingStep:
         return run.step_call(self.name, self.function, args, kwargs)
 
 
+class RecordingSpan:
+    """One SPANS function as app.py calls it, through the current run if any."""
+
+    def __init__(self, name, function):
+        self.name, self.function = name, function
+
+    def __call__(self, *args, **kwargs):
+        run = current_run.get()
+        if run is None:
+            return self.function(*args, **kwargs)
+        return run.span_call(self.name, self.function, args, kwargs)
+
+
 def app_namespace():
     """app.py's globals, where answer_turn looks up its pipeline steps."""
     module = sys.modules.get("app")
@@ -432,7 +493,7 @@ def install_hooks(app_globals):
 
     seams = [(memory, "client"), (generate_response, "client"), (generate_response, "run_tool")]
     missing = [f"{module.__name__}.{name}" for module, name in seams if not hasattr(module, name)]
-    missing += [f"app.{name}" for name in STEPS if name not in app_globals]
+    missing += [f"app.{name}" for name in (*STEPS, *SPANS) if name not in app_globals]
     if missing:
         raise RuntimeError(f"App seams moved, nothing would be recorded: {', '.join(missing)}")
     if not isinstance(memory.client, RecordingClient):
@@ -444,6 +505,9 @@ def install_hooks(app_globals):
     for name in STEPS:
         if not isinstance(app_globals[name], RecordingStep):
             app_globals[name] = RecordingStep(name, app_globals[name])
+    for name in SPANS:
+        if not isinstance(app_globals[name], RecordingSpan):
+            app_globals[name] = RecordingSpan(name, app_globals[name])
 
 
 @contextmanager

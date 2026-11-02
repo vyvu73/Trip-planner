@@ -186,6 +186,9 @@ class FakeKitaru:
         return {node.name: node for node in self.children(NodeType.SPAN)
                 if node.attributes.get("kind") == "pipeline"}
 
+    def functions(self):
+        return [node for node in self.children(NodeType.SPAN) if node.attributes.get("kind") == "function"]
+
     def everything_sent(self):
         dumped = [self.session.model_dump(mode="json")] if self.session else []
         dumped += [node.model_dump(mode="json") for node in self.nodes.values()]
@@ -292,7 +295,7 @@ class RecordingTests(AdapterTestCase):
         self.assertEqual(rounds[0].requested_model, "gpt-5-mini")
         self.assertEqual(rounds[0].model, "gpt-5-mini-served")
         self.assertEqual(rounds[0].tokens.input_tokens, 10)
-        self.assertTrue(all(node.parent_external_id == ROOT_ID for node in [router, *rounds]))
+        self.assertTrue(all(node.parent_external_id == ROOT_ID for node in rounds))
 
         [tool] = kitaru.tools()
         self.assertEqual((tool.tool_name, tool.inputs, tool.outputs),
@@ -716,6 +719,60 @@ class PipelineStepTests(AdapterTestCase):
         self.retrieve.reset_mock()
         app.retrieve_chunks("Hikes?", k=3)
         self.retrieve.assert_called_once_with("Hikes?", k=3)
+
+
+# --- function spans -----------------------------------------------------------
+
+class FunctionSpanTests(AdapterTestCase):
+    def test_router_call_is_nested_in_a_route_message_span(self):
+        kitaru = FakeKitaru()
+        self.run_turn(weather_turn(), kitaru)
+
+        [span] = kitaru.functions()
+        self.assertEqual((span.name, span.node_type), ("route_message", NodeType.SPAN))
+        self.assertEqual(span.parent_external_id, ROOT_ID)
+        self.assertEqual(span.status, NodeStatus.COMPLETED)
+        self.assertEqual(span.inputs, {"history": [], "question": "Weather in Yosemite?"})
+        self.assertEqual((span.outputs["route"], span.outputs["park_codes"]), ("in_scope", ["yose"]))
+
+        router, *rounds = kitaru.children(NodeType.LLM_CALL)
+        self.assertEqual(router.parent_external_id, span.external_id)
+        self.assertTrue(all(node.parent_external_id == ROOT_ID for node in rounds))
+        self.assertLess(kitaru.order.index(span.external_id), kitaru.order.index("resp_router"))
+        self.assertNotIn("route_message", kitaru.steps())    # never under a replay policy
+
+    def test_router_failure_fails_its_span(self):
+        responses = FakeResponses(parse=[TimeoutError("openai timed out")])
+        kitaru = FakeKitaru()
+
+        with self.assertRaises(TimeoutError):
+            self.run_turn(responses, kitaru)
+        [span] = kitaru.functions()
+        self.assertEqual(span.status, NodeStatus.FAILED)
+        self.assertIn("openai timed out", span.error)
+        [router] = kitaru.children(NodeType.LLM_CALL)
+        self.assertEqual(router.parent_external_id, span.external_id)
+
+    def test_router_runs_live_in_a_replay(self):
+        responses = weather_turn()
+        policy = all_tools(history())
+        kitaru = FakeKitaru(replay=replay(policy), baseline=[baseline_tool("get_weather", WEATHER_ARGS, "rain")])
+        self.run_turn(responses, kitaru)
+
+        self.assertEqual(responses.calls[0][0], "parse")
+        [span] = kitaru.functions()
+        self.assertEqual(span.attributes, {"kind": "function"})
+
+    def test_route_message_passes_through_outside_a_turn(self):
+        kitaru = FakeKitaru()
+        self.run_turn(weather_turn(), kitaru)
+        recorded = len(kitaru.nodes)
+
+        responses = FakeResponses(parse=[router_response("in_scope")])
+        with mock.patch.object(memory, "client", SimpleNamespace(responses=responses)):
+            decision = app.route_message([], "Weather?")
+        self.assertEqual(decision.route, "in_scope")
+        self.assertEqual(len(kitaru.nodes), recorded)
 
 
 class EventLoopTests(unittest.TestCase):
