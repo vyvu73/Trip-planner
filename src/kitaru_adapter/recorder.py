@@ -25,7 +25,8 @@ from kitaru.api_models.v1.session_node import (
 from src.kitaru_adapter.capture import capture, capture_error
 
 FRAMEWORK = "openai-responses"
-ADAPTER_VERSION = "0.3.0"    # 0.2.0: pipeline steps recorded as spans; 0.3.0: route_message span
+ADAPTER_VERSION = "0.4.0"    # 0.2.0: pipeline steps recorded as spans; 0.3.0: route_message span;
+                             # 0.4.0: query embedding nested under retrieve_chunks
 ROOT_ID = "turn"
 BATCH_SIZE = 100
 # A failure write must not hang the worker after the turn already failed.

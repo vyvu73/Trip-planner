@@ -1,7 +1,8 @@
 # Record one trip-planner turn as a Kitaru session, applying replay settings.
 #
 # Hooks the places the app talks to the outside world: memory.client (the
-# router), generate_response.client (each answer round),
+# router), generate_response.client (each answer round), retrieve_chunks.client
+# (the query embedding, nested under the live retrieve_chunks step),
 # generate_response.run_tool (tool dispatch), and the pipeline steps the app
 # runs on every question, retrieve_chunks and alerts_context, as app.py
 # calls them. The app's code is unchanged. The hooks are installed once and
@@ -43,7 +44,7 @@ from src.kitaru_adapter.capture import capture_error, has_capture_marker, secret
 from src.kitaru_adapter.policy import APPROVED_PASSTHROUGH_TOOLS, lookup_match, prepare_policies
 from src.kitaru_adapter.recorder import ROOT_ID, KitaruRecordingError, Recorder, now
 
-ROUTER, ANSWER = "router", "answer"
+ROUTER, ANSWER, EMBEDDING = "router", "answer", "embedding"
 MODEL_PROVIDER = "openai"
 OVERRIDE_PARAMS = ("reasoning", "temperature", "max_output_tokens")
 RECORDED_PARAMS = (*OVERRIDE_PARAMS, "tool_choice", "stream")
@@ -274,6 +275,49 @@ class TurnRun:
         if role == ANSWER:
             self.answer_node = external_id
 
+    # --- embedding calls -----------------------------------------------------
+
+    def embedding_call(self, call, kwargs):
+        """Run an embedding call live, recorded under the open step. Replay
+        overrides never apply: they name chat models, not embedding models."""
+        started = now()
+        try:
+            response = call(**kwargs)
+        except BaseException as error:
+            self.record_embedding(kwargs, started, None, error)
+            self.note(error)
+            raise
+        self.record_embedding(kwargs, started, response, None)
+        return response
+
+    def record_embedding(self, kwargs, started, response, error):
+        recorder = self.recorder
+        outputs = tokens = None
+        if response is not None:
+            data = getattr(response, "data", None) or []
+            # The vectors are long and unreadable; record their count and size.
+            outputs = {"embeddings": len(data),
+                       "dimensions": len(data[0].embedding) if data else None}
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                tokens = TokenUsage(input_tokens=getattr(usage, "prompt_tokens", None), output_tokens=0)
+        recorder.add_node(
+            node_type=NodeType.LLM_CALL,
+            name="openai.embeddings.create",
+            parent=self.open_span or ROOT_ID,
+            started_at=started,
+            inputs={"input": recorder.capture(kwargs.get("input"))},
+            outputs=outputs,
+            status=NodeStatus.FAILED if error is not None else NodeStatus.COMPLETED,
+            error=capture_error(error, recorder.secrets) if error is not None else None,
+            requested_model=kwargs.get("model"),
+            model=getattr(response, "model", None) if response is not None else None,
+            model_provider=MODEL_PROVIDER,
+            tokens=tokens,
+            input_text_selector="/input" if isinstance(kwargs.get("input"), str) else None,
+            attributes={"role": EMBEDDING},
+        )
+
     # --- tool calls ----------------------------------------------------------
 
     def tool_call(self, name, arguments_json, run_tool):
@@ -324,29 +368,37 @@ class TurnRun:
     # --- pipeline steps ------------------------------------------------------
 
     def step_call(self, name, function, args, kwargs):
+        step_id = uuid.uuid4().hex
+        position = len(self.recorder.buffer)    # sent before the calls it makes
         started = now()
         bound = inspect.signature(function).bind(*args, **kwargs)
         bound.apply_defaults()
         arguments = dict(bound.arguments)
         decision = None
+        step = (name, arguments, started, step_id, position)
+        previous = self.open_span
         try:
             decision = self.policies.decide_arguments(name, arguments)
             if decision.passthrough:
-                value = function(*args, **kwargs)
+                # A live step is the parent of the embedding calls it makes.
+                self.open_span = step_id
+                try:
+                    value = function(*args, **kwargs)
+                finally:
+                    self.open_span = previous
             elif decision.error is not None:
                 # The step raised in the recorded run; the app saw an exception.
                 raise RuntimeError(f"Recorded {name} failed: {decision.error}")
             else:
                 value = decision.value
         except BaseException as error:
-            self.record_step(name, arguments, started, decision, None,
-                             capture_error(error, self.recorder.secrets))
+            self.record_step(*step, decision, None, capture_error(error, self.recorder.secrets))
             self.note(error)
             raise
-        self.record_step(name, arguments, started, decision, STEPS[name](value), None)
+        self.record_step(*step, decision, STEPS[name](value), None)
         return value
 
-    def record_step(self, name, arguments, started, decision, output, error):
+    def record_step(self, name, arguments, started, step_id, position, decision, output, error):
         recorder = self.recorder
         attributes = {"kind": "pipeline"}
         if decision is not None and decision.policy:
@@ -364,6 +416,8 @@ class TurnRun:
             outputs=recorder.capture(output),
             status=NodeStatus.FAILED if error is not None else NodeStatus.COMPLETED,
             error=error,
+            external_id=step_id,
+            position=position,
             attributes=attributes,
         )
 
@@ -425,12 +479,26 @@ class RecordingResponses:
         return run.model_call(self._responses.parse, kwargs, self._role)
 
 
+class RecordingEmbeddings:
+    def __init__(self, embeddings):
+        self._embeddings = embeddings
+
+    def create(self, **kwargs):
+        run = current_run.get()
+        if run is None:
+            return self._embeddings.create(**kwargs)
+        return run.embedding_call(self._embeddings.create, kwargs)
+
+
 class RecordingClient:
-    """An OpenAI client whose Responses calls go through the current run, if any."""
+    """An OpenAI client whose Responses and embedding calls go through the current run, if any."""
 
     def __init__(self, client, role):
         self._client = client
-        self.responses = RecordingResponses(client.responses, role)
+        if hasattr(client, "responses"):
+            self.responses = RecordingResponses(client.responses, role)
+        if hasattr(client, "embeddings"):
+            self.embeddings = RecordingEmbeddings(client.embeddings)
 
     def __getattr__(self, name):
         return getattr(self._client, name)
@@ -490,8 +558,10 @@ def install_hooks(app_globals):
     __main__ under `python app.py`, so callers pass it rather than import app.
     """
     from src.generation import generate_response, memory
+    from src.retrieval import retrieve_chunks as retrieval
 
-    seams = [(memory, "client"), (generate_response, "client"), (generate_response, "run_tool")]
+    seams = [(memory, "client"), (generate_response, "client"), (generate_response, "run_tool"),
+             (retrieval, "client")]
     missing = [f"{module.__name__}.{name}" for module, name in seams if not hasattr(module, name)]
     missing += [f"app.{name}" for name in (*STEPS, *SPANS) if name not in app_globals]
     if missing:
@@ -500,6 +570,8 @@ def install_hooks(app_globals):
         memory.client = RecordingClient(memory.client, ROUTER)
     if not isinstance(generate_response.client, RecordingClient):
         generate_response.client = RecordingClient(generate_response.client, ANSWER)
+    if not isinstance(retrieval.client, RecordingClient):
+        retrieval.client = RecordingClient(retrieval.client, EMBEDDING)
     if not isinstance(generate_response.run_tool, RecordingTool):
         generate_response.run_tool = RecordingTool(generate_response.run_tool)
     for name in STEPS:
