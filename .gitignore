@@ -5,7 +5,7 @@
 # Kitaru server notes (IPs, account IDs) - keep local only
 kitaru-server-md/
 CLAUDE.md
-
+docs/
 # Python cache
 __pycache__/
 *.pyc
@@ -17,3 +17,4 @@ __pycache__/
 
 # Personal notes
 notes/
+agents.md
