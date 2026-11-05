@@ -1,0 +1,11 @@
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+.claude/
+kitaru-server-md/
+infra/
+tests/
+plans/
+data/
+*.dump

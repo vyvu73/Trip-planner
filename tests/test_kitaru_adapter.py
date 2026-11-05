@@ -38,6 +38,7 @@ from kitaru.client.exceptions import AuthorizationError
 import app
 import kitaru_replay
 from src.generation import generate_response, memory
+from src.retrieval import retrieve_chunks as retrieval
 from src.retrieval.fetch_alerts import alerts_context as real_alerts_context
 from src.retrieval.retrieve_chunks import retrieve_chunks as real_retrieve_chunks
 from src.generation.memory import RouteDecision
@@ -186,6 +187,9 @@ class FakeKitaru:
         return {node.name: node for node in self.children(NodeType.SPAN)
                 if node.attributes.get("kind") == "pipeline"}
 
+    def functions(self):
+        return [node for node in self.children(NodeType.SPAN) if node.attributes.get("kind") == "function"]
+
     def everything_sent(self):
         dumped = [self.session.model_dump(mode="json")] if self.session else []
         dumped += [node.model_dump(mode="json") for node in self.nodes.values()]
@@ -292,7 +296,7 @@ class RecordingTests(AdapterTestCase):
         self.assertEqual(rounds[0].requested_model, "gpt-5-mini")
         self.assertEqual(rounds[0].model, "gpt-5-mini-served")
         self.assertEqual(rounds[0].tokens.input_tokens, 10)
-        self.assertTrue(all(node.parent_external_id == ROOT_ID for node in [router, *rounds]))
+        self.assertTrue(all(node.parent_external_id == ROOT_ID for node in rounds))
 
         [tool] = kitaru.tools()
         self.assertEqual((tool.tool_name, tool.inputs, tool.outputs),
@@ -695,6 +699,7 @@ class PipelineStepTests(AdapterTestCase):
     def test_project_approves_only_the_read_only_steps(self):
         self.assertEqual(APPROVED_PASSTHROUGH_TOOLS, {"retrieve_chunks", "alerts_context"})
 
+
     def test_approved_step_runs_live(self):
         self.retrieve.return_value = [CHUNK]
         policy = all_tools(static(StaticCase(match_mode=StaticMatchMode.SUBSET, result="sun")),
@@ -716,6 +721,129 @@ class PipelineStepTests(AdapterTestCase):
         self.retrieve.reset_mock()
         app.retrieve_chunks("Hikes?", k=3)
         self.retrieve.assert_called_once_with("Hikes?", k=3)
+
+
+# --- embedding calls ------------------------------------------------------------
+
+def embedding_response(dimensions=4):
+    return SimpleNamespace(model="text-embedding-3-small-v1",
+                           data=[SimpleNamespace(embedding=[0.1] * dimensions)],
+                           usage=SimpleNamespace(prompt_tokens=6, total_tokens=6))
+
+
+class EmbeddingTests(AdapterTestCase):
+    def setUp(self):
+        super().setUp()
+        self.embeddings = mock.Mock()
+        self.embeddings.create.return_value = embedding_response()
+        patcher = mock.patch.object(retrieval, "client", SimpleNamespace(embeddings=self.embeddings))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def retrieve(question, k=7):
+            # What the real step does first: embed the query with the module's client.
+            retrieval.client.embeddings.create(model="text-embedding-3-small", input=question)
+            return [CHUNK]
+        self.retrieve.side_effect = retrieve
+
+    def test_live_retrieval_records_its_embedding_under_the_step(self):
+        kitaru = FakeKitaru()
+        self.run_turn(weather_turn(), kitaru)
+
+        step = kitaru.steps()["retrieve_chunks"]
+        [embedding] = [node for node in kitaru.children(NodeType.LLM_CALL)
+                       if node.name == "openai.embeddings.create"]
+        self.assertEqual(embedding.parent_external_id, step.external_id)
+        self.assertEqual(embedding.inputs, {"input": "Weather in Yosemite?"})
+        self.assertEqual(embedding.outputs, {"embeddings": 1, "dimensions": 4})    # no vector
+        self.assertEqual((embedding.requested_model, embedding.model),
+                         ("text-embedding-3-small", "text-embedding-3-small-v1"))
+        self.assertEqual((embedding.tokens.input_tokens, embedding.tokens.output_tokens), (6, 0))
+        self.assertEqual(embedding.attributes, {"role": "embedding"})
+        self.assertLess(kitaru.order.index(step.external_id), kitaru.order.index(embedding.external_id))
+
+    def test_a_static_step_makes_no_embedding_call(self):
+        policy = all_tools(history(), retrieve_chunks=any_call([RECORDED_CHUNK]))
+        kitaru = FakeKitaru(replay=replay(policy), baseline=[baseline_tool("get_weather", WEATHER_ARGS, "rain")])
+        self.run_turn(weather_turn(), kitaru)
+
+        self.embeddings.create.assert_not_called()
+        self.assertFalse([node for node in kitaru.children(NodeType.LLM_CALL)
+                          if node.name == "openai.embeddings.create"])
+
+    def test_model_override_leaves_the_embedding_model_alone(self):
+        policy = all_tools(history(), retrieve_chunks=PassthroughConfig())
+        kitaru = FakeKitaru(replay=replay(policy, override=ReplayOverride(model="gpt-5")),
+                            baseline=[baseline_tool("get_weather", WEATHER_ARGS, "rain")])
+        self.run_turn(weather_turn(), kitaru)
+
+        self.embeddings.create.assert_called_once_with(model="text-embedding-3-small",
+                                                       input="Weather in Yosemite?")
+
+    def test_embedding_failure_fails_its_node(self):
+        self.embeddings.create.side_effect = ConnectionError("openai down")
+        kitaru = FakeKitaru()
+
+        with self.assertRaisesRegex(ConnectionError, "openai down"):
+            self.run_turn(weather_turn(), kitaru)
+        [embedding] = [node for node in kitaru.children(NodeType.LLM_CALL)
+                       if node.name == "openai.embeddings.create"]
+        self.assertEqual(embedding.status, NodeStatus.FAILED)
+        self.assertEqual(embedding.parent_external_id, kitaru.steps()["retrieve_chunks"].external_id)
+
+
+# --- function spans -----------------------------------------------------------
+
+class FunctionSpanTests(AdapterTestCase):
+    def test_router_call_is_nested_in_a_route_message_span(self):
+        kitaru = FakeKitaru()
+        self.run_turn(weather_turn(), kitaru)
+
+        [span] = kitaru.functions()
+        self.assertEqual((span.name, span.node_type), ("route_message", NodeType.SPAN))
+        self.assertEqual(span.parent_external_id, ROOT_ID)
+        self.assertEqual(span.status, NodeStatus.COMPLETED)
+        self.assertEqual(span.inputs, {"history": [], "question": "Weather in Yosemite?"})
+        self.assertEqual((span.outputs["route"], span.outputs["park_codes"]), ("in_scope", ["yose"]))
+
+        router, *rounds = kitaru.children(NodeType.LLM_CALL)
+        self.assertEqual(router.parent_external_id, span.external_id)
+        self.assertTrue(all(node.parent_external_id == ROOT_ID for node in rounds))
+        self.assertLess(kitaru.order.index(span.external_id), kitaru.order.index("resp_router"))
+        self.assertNotIn("route_message", kitaru.steps())    # never under a replay policy
+
+    def test_router_failure_fails_its_span(self):
+        responses = FakeResponses(parse=[TimeoutError("openai timed out")])
+        kitaru = FakeKitaru()
+
+        with self.assertRaises(TimeoutError):
+            self.run_turn(responses, kitaru)
+        [span] = kitaru.functions()
+        self.assertEqual(span.status, NodeStatus.FAILED)
+        self.assertIn("openai timed out", span.error)
+        [router] = kitaru.children(NodeType.LLM_CALL)
+        self.assertEqual(router.parent_external_id, span.external_id)
+
+    def test_router_runs_live_in_a_replay(self):
+        responses = weather_turn()
+        policy = all_tools(history())
+        kitaru = FakeKitaru(replay=replay(policy), baseline=[baseline_tool("get_weather", WEATHER_ARGS, "rain")])
+        self.run_turn(responses, kitaru)
+
+        self.assertEqual(responses.calls[0][0], "parse")
+        [span] = kitaru.functions()
+        self.assertEqual(span.attributes, {"kind": "function"})
+
+    def test_route_message_passes_through_outside_a_turn(self):
+        kitaru = FakeKitaru()
+        self.run_turn(weather_turn(), kitaru)
+        recorded = len(kitaru.nodes)
+
+        responses = FakeResponses(parse=[router_response("in_scope")])
+        with mock.patch.object(memory, "client", SimpleNamespace(responses=responses)):
+            decision = app.route_message([], "Weather?")
+        self.assertEqual(decision.route, "in_scope")
+        self.assertEqual(len(kitaru.nodes), recorded)
 
 
 class EventLoopTests(unittest.TestCase):
